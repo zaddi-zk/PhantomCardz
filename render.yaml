@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: phantomcardz
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers
+    healthCheckPath: /api/health
+    disk:
+      name: phantomdata
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: RESET_DEV_CODE
+        value: "false"
+      - key: ALLOWED_HOSTS
+        sync: false        # set to: phantomcardz.cc,www.phantomcardz.cc,ph-xxxx.onrender.com
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: CASHAPP_HANDLE
+        sync: false
+      - key: BTC_ADDRESS
+        sync: false
+      - key: ETH_ADDRESS
+        sync: false
+      - key: LTC_ADDRESS
+        sync: false
+      - key: ADMIN_TELEGRAM
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false

@@ -10,3 +10,5 @@ market.log
 nohup.out
 .env
 index-2.html
+!requirements.txt
+!render.yaml

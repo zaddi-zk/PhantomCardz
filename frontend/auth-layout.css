@@ -1,0 +1,115 @@
+html:has(.spider-entry-page) {
+  zoom: 1;
+  overflow-x: clip;
+}
+
+body:has(.spider-entry-page) {
+  min-height: 100vh;
+  min-height: 100svh;
+}
+
+.spider-entry-page {
+  min-height: 100vh !important;
+  min-height: 100svh !important;
+}
+
+.spider-entry-content > * {
+  zoom: 1 !important;
+}
+
+.spider-entry-content {
+  max-width: 490px;
+  zoom: 1 !important;
+}
+
+.spider-login-card {
+  padding: 30px 30px 32px;
+}
+
+.spider-login-card > .nexus-brand {
+  min-height: 0;
+  margin-bottom: 0;
+}
+
+.spider-login-card .auth-logo,
+.spider-login-card img[alt*="Logo"] {
+  width: 390px;
+  height: 98px;
+  object-fit: contain;
+  max-width: 100%;
+  display: block;
+  margin: 0 auto 20px auto;
+}
+
+.spider-login-card .spider-auth-heading h1 {
+  font-size: 34px;
+}
+
+.spider-login-card .spider-auth-heading p {
+  font-size: 17px;
+}
+
+.spider-login-card .spider-form {
+  gap: 24px;
+}
+
+.spider-login-card .spider-field-label {
+  font-size: 17px;
+}
+
+.spider-login-card .spider-input {
+  height: 52px;
+  font-size: 17px;
+}
+
+.spider-login-card .spider-captcha {
+  min-height: 66px;
+}
+
+.spider-login-card .spider-captcha-input {
+  font-size: 15px;
+}
+
+.spider-login-card .spider-primary-button {
+  min-height: 54px;
+  font-size: 17px;
+}
+
+.spider-login-card .spider-auth-switch {
+  font-size: 16px;
+}
+
+.spider-login-card > .spider-entry-footer {
+  gap: 12px;
+  margin-top: 30px;
+  font-size: 15px;
+}
+
+.nexus-drawer-user-mark img {
+  display: block;
+  width: 48px;
+  height: 48px;
+  object-fit: contain;
+}
+
+@media (max-width: 560px) {
+  .spider-entry-page {
+    padding: 24px 16px;
+  }
+
+  .spider-login-card {
+    padding: 26px 20px 28px;
+  }
+
+  .spider-login-card .spider-auth-heading h1 {
+    font-size: 27px;
+  }
+
+  .spider-login-card .spider-form {
+    gap: 22px;
+  }
+
+  .spider-login-card > .spider-entry-footer {
+    font-size: 13px;
+  }
+}

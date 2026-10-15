@@ -186,3 +186,10 @@ Notifications are fire-and-forget (never block or fail a request). Without the k
 
 See [`docs/DEPLOY.md`](docs/DEPLOY.md) for DNS, systemd unit, nginx reverse proxy,
 and Let's Encrypt HTTPS setup for `phantomcardz.cc`.
+
+## Running on Render
+
+See [`docs/DEPLOY-RENDER.md`](docs/DEPLOY-RENDER.md) for the Render Blueprint
+(`render.yaml`), the persistent-disk `DATA_DIR` layout, SMTP reset-email setup, and
+backups. On Render the start command is `uvicorn main:app`; local development still
+uses `tools/start.sh`.

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """PhantomCardz — cards & accounts marketplace backend (FastAPI + SQLite)."""
 import os, sqlite3, secrets, random, time, hashlib, string, json
+import smtplib
+from email.message import EmailMessage
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 
@@ -12,10 +14,13 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
-DB_PATH  = os.path.join(APP_ROOT, "market.db")
+DATA_DIR = os.getenv("DATA_DIR", APP_ROOT)          # Render: mount path of persistent disk
 FRONTEND = os.path.join(APP_ROOT, "frontend")
-UPLOADS  = os.path.join(APP_ROOT, "uploads")
-os.makedirs(UPLOADS, exist_ok=True)
+DB_PATH  = os.path.join(DATA_DIR, "market.db")
+UPLOADS  = os.path.join(DATA_DIR, "uploads")
+LOGS     = os.path.join(DATA_DIR, "logs")
+for _d in (DATA_DIR, UPLOADS, LOGS):
+    os.makedirs(_d, exist_ok=True)
 
 def _load_env():
     p = os.path.join(APP_ROOT, ".env")
@@ -39,6 +44,12 @@ DOMAINS      = [d.strip() for d in os.getenv("ALLOWED_HOSTS", "phantomcardz.cc,w
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 TG_BOT  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+RESET_DEV_CODE = os.getenv("RESET_DEV_CODE", "true").lower() == "true"
 
 security = HTTPBearer(auto_error=False)
 
@@ -48,7 +59,9 @@ class ApiError(Exception):
         self.message = message
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -70,6 +83,12 @@ def ts(v) -> Dict[str, int]:
 def rand_str(n: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
+def new_username(conn) -> str:
+    while True:
+        username = f"phan-{secrets.token_hex(4)}"
+        if not conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            return username
+
 _rl: dict = {}
 def _rl_hit(key: str, limit: int, window: int) -> bool:
     t = time.time()
@@ -78,7 +97,6 @@ def _rl_hit(key: str, limit: int, window: int) -> bool:
     _rl[key] = hits
     return len(hits) > limit
 
-LOGS = os.path.join(APP_ROOT, "logs"); os.makedirs(LOGS, exist_ok=True)
 def audit(event: str, actor: str = "-", detail: str = ""):
     with open(os.path.join(LOGS, "audit.log"), "a") as f:
         f.write(f"{now()} | {event} | {actor} | {detail}\n")
@@ -96,10 +114,30 @@ def tg_notify(text: str):
     except Exception:
         pass
 
+def send_reset_email(to_email: str, code: str):
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS):
+        return False
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = f"{SITE} password reset"
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+        msg.set_content(
+            f"Your {SITE} reset code is: {code}\n\n"
+            f"It expires in 15 minutes.\nIf you did not request this, ignore this email.")
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+            s.starttls()
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        return True
+    except Exception:
+        return False
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT UNIQUE NOT NULL,
+    username TEXT,
     password_hash TEXT NOT NULL,
     telegram TEXT,
     balance REAL DEFAULT 0,
@@ -223,6 +261,10 @@ def luhn_generate(length: int = 16) -> str:
 def init_db():
     conn = db()
     conn.executescript(SCHEMA)
+    user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
+    if "username" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
     conn.executescript("""
     CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
@@ -237,12 +279,17 @@ def init_db():
     if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         c.execute("INSERT INTO users(email,password_hash,telegram,balance,rank,created_at) VALUES(?,?,?,?,?,?)",
                   (ADMIN_EMAIL, h(ADMIN_PASS, ADMIN_EMAIL), ADMIN_TG, 1000.0, "admin", now()))
+    missing_usernames = c.execute(
+        "SELECT id FROM users WHERE username IS NULL OR TRIM(username)=''"
+    ).fetchall()
+    for row in missing_usernames:
+        c.execute("UPDATE users SET username=? WHERE id=?", (new_username(conn), row["id"]))
     if c.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 0:
         c.execute("INSERT INTO announcements(content,link,active,bannerColor,created_at) VALUES(?,?,?,?,?)",
                   (f"Welcome to {SITE} — deposits are open!", None, 1, "#000000", now()))
     if c.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
         seeds = [
-            ("Hotmail FA", "Login and loot for goodies, easiest way to make a band!", 1, "Hotmails FA (Random)", 35.0, 25),
+            ("Hotmail FA", "Login and loot for goodies, easiest way to make a band!", 1, "Hotmails FA (Random)", 5.0, 25),
             ("Outlook FA", "Fresh farmed outlooks, ready for work.", 0, "Outlooks FA (Random)", 30.0, 40),
             ("Combo Lists", "Fresh combo lists for cracking.", 0, "Combos (10k lines)", 10.0, 50),
         ]
@@ -349,7 +396,8 @@ def create_token(conn, user_id: int) -> str:
     return token
 
 def user_out(u) -> dict:
-    return {"id": u["id"], "email": u["email"], "balance": u["balance"], "rank": u["rank"]}
+    return {"id": u["id"], "email": u["email"], "username": u["username"],
+            "balance": u["balance"], "rank": u["rank"]}
 
 def get_setting(conn, key: str, fallback="{}"):
     r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -393,8 +441,9 @@ def register(request: Request, data: RegisterIn):
         raise ApiError(429, "Too many registrations, slow down")
     conn = db()
     try:
-        conn.execute("INSERT INTO users(email,password_hash,telegram,balance,rank,created_at) VALUES(?,?,?,?,?,?)",
-                     (data.email, h(data.password, data.email), data.telegram, 0.0, "user", now()))
+        username = new_username(conn)
+        conn.execute("INSERT INTO users(email,username,password_hash,telegram,balance,rank,created_at) VALUES(?,?,?,?,?,?,?)",
+                     (data.email, username, h(data.password, data.email), data.telegram, 0.0, "user", now()))
         u = conn.execute("SELECT * FROM users WHERE email=?", (data.email,)).fetchone()
         token = create_token(conn, u["id"])
         conn.commit()
@@ -416,7 +465,8 @@ def me(user: dict = Depends(get_current_user)):
     spent = conn.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE user_id=? AND status='completed'",
                          (user["id"],)).fetchone()[0]
     conn.close()
-    return {"id": user["id"], "email": user["email"], "balance": user["balance"], "rank": user["rank"],
+    return {"id": user["id"], "email": user["email"], "username": user["username"],
+            "balance": user["balance"], "rank": user["rank"],
             "telegram": user["telegram"], "orders": n, "totalSpent": round(spent, 2)}
 
 @app.post("/api/logout")
@@ -519,10 +569,76 @@ def features():
     conn.close()
     return data
 
+MANUAL_METHODS = ("cashapp", "venmo", "zelle", "chime", "applepay")
+MANUAL_HANDLE_FIELD = {"cashapp": "tag", "venmo": "handle", "zelle": "handle",
+                       "chime": "handle", "applepay": "handle"}
+MANUAL_SETTING_KEY = {"cashapp": "cashapp-tag", "venmo": "venmo-handle",
+                      "zelle": "zelle-handle", "chime": "chime-handle",
+                      "applepay": "applepay-handle"}
+CRYPTO_ADDRESS_KEY = {"BTC": "bitcoin", "ETH": "ethereum", "LTC": "litecoin", "USDT": "ethereum"}
+
+def _json_setting(conn, key: str, fallback=None):
+    r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    if not r:
+        return fallback
+    try:
+        return json.loads(r["value"])
+    except Exception:
+        return r["value"]
+
+def manual_payments_public(conn) -> dict:
+    """Nested shape the frozen SPA expects: {method: {enabled, fee, tag|handle}}."""
+    pm = _json_setting(conn, "payment_methods", {}) or {}
+    legacy = _json_setting(conn, "manual_payments", {}) or {}
+    out = {}
+    for m in MANUAL_METHODS:
+        field = MANUAL_HANDLE_FIELD[m]
+        val = _json_setting(conn, MANUAL_SETTING_KEY[m], None)
+        if val is None:
+            lv = legacy.get(m)
+            if isinstance(lv, dict):
+                val = lv.get(field) or lv.get("handle") or lv.get("tag") or ""
+            else:
+                val = lv or ""
+        try:
+            fee = float(_json_setting(conn, f"{m}-fee", 0) or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+        out[m] = {"enabled": bool(pm.get(m, False)), "fee": fee, field: val or ""}
+    return out
+
+def manual_handle(conn, method: str, fallback: str = "") -> str:
+    return manual_payments_public(conn).get(method, {}).get(MANUAL_HANDLE_FIELD[method], fallback) or fallback
+
+def crypto_address(conn, coin: str) -> str:
+    mp = _json_setting(conn, "manual_payments", {}) or {}
+    key = CRYPTO_ADDRESS_KEY.get((coin or "BTC").upper(), "bitcoin")
+    return mp.get(key) or {"bitcoin": BTC_ADDR, "ethereum": ETH_ADDR, "litecoin": LTC_ADDR}.get(key, BTC_ADDR)
+
+def deposit_out(r, email: Optional[str] = None) -> dict:
+    """Serialize a deposit row in the shape the frozen SPA expects."""
+    method = r["method"] or ""
+    usd = float(r["amount"] or 0)
+    out = {
+        "id": r["id"],
+        "type": "crypto" if method.startswith("crypto") else method,
+        "method": method,
+        "amount": int(round(usd * 100)),
+        "amountUsd": usd,
+        "paymentId": r["reference"],
+        "orderId": r["reference"],
+        "reference": r["reference"],
+        "status": r["status"],
+        "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(r["created_at"] or 0))),
+    }
+    if email is not None:
+        out["email"] = email
+    return out
+
 @app.get("/api/site-settings/manual-payments")
 def manual_payments():
     conn = db()
-    data = json.loads(get_setting(conn, "manual_payments"))
+    data = manual_payments_public(conn)
     conn.close()
     return data
 
@@ -678,6 +794,9 @@ class CashappIn(BaseModel):
     amount: float
     cashtag: Optional[str] = None
 
+def _deposit_ref() -> str:
+    return secrets.token_hex(4).upper()
+
 @app.post("/api/orders/cashapp")
 def deposit_cashapp(data: CashappIn, user: dict = Depends(get_current_user)):
     if data.amount <= 0: raise ApiError(400, "Invalid amount")
@@ -686,45 +805,104 @@ def deposit_cashapp(data: CashappIn, user: dict = Depends(get_current_user)):
     if data.amount < mins.get("cashapp", 5):
         conn.close()
         raise ApiError(400, f"Minimum deposit is ${mins.get('cashapp', 5)}")
-    mp = json.loads(get_setting(conn, "manual_payments"))
-    ref = secrets.token_hex(4).upper()
+    handle = manual_handle(conn, "cashapp", CASHAPP)
+    ref = _deposit_ref()
+    note = f"{SITE.upper()}-{ref}"
     conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
                  (user["id"], "cashapp", data.amount, ref, "pending", now()))
     conn.commit()
     tg_notify(f"[{SITE}] CashApp deposit req {ref} by {user['email']}: ${data.amount}")
     conn.close()
-    return {"status": "pending", "reference": ref,
-            "instructions": f"Send ${data.amount} via CashApp to {mp.get('cashapp','$PhantomCardz')} then message {ADMIN_TG} on Telegram with code {ref} and your email {user['email']}"}
+    return {"status": "pending", "reference": ref, "order": {"id": ref}, "paymentNote": note, "cashappTag": handle,
+            "instructions": f"Send ${data.amount} via CashApp to {handle} then message {ADMIN_TG} on Telegram with code {ref} and your email {user['email']}"}
+
+class ManualDepositIn(BaseModel):
+    amount: float
+
+@app.post("/api/deposits/{method}")
+def deposit_manual(method: str, data: ManualDepositIn, user: dict = Depends(get_current_user)):
+    if method not in MANUAL_METHODS:
+        raise ApiError(404, "Unsupported method")
+    if data.amount <= 0:
+        raise ApiError(400, "Invalid amount")
+    conn = db()
+    mins = json.loads(get_setting(conn, "min_deposits"))
+    minimum = mins.get(method, 5)
+    if data.amount < minimum:
+        conn.close()
+        raise ApiError(400, f"Minimum deposit for {method} is ${minimum}")
+    handle = manual_handle(conn, method, "")
+    ref = _deposit_ref()
+    note = f"{SITE.upper()}-{ref}"
+    conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
+                 (user["id"], method, data.amount, ref, "pending", now()))
+    conn.commit()
+    tg_notify(f"[{SITE}] {method} deposit req {ref} by {user['email']}: ${data.amount}")
+    conn.close()
+    return {"status": "pending", "reference": ref, "order": {"id": ref}, "paymentNote": note, "handle": handle,
+            "instructions": f"Send ${data.amount} via {method} to {handle} and include note {note}"}
 
 class CryptoIn(BaseModel):
-    amount: float
+    amount: Any = 0
     currency: str = "BTC"
+    payCurrency: Optional[str] = None
+    purpose: Optional[str] = None
+
+def _crypto_tracking(r) -> dict:
+    method = (r["method"] or "crypto:BTC").split(":", 1)
+    coin = (method[1] if len(method) > 1 else "BTC").upper()
+    conn = db()
+    addr = crypto_address(conn, coin)
+    conn.close()
+    usd = float(r["amount"] or 0)
+    created = int(r["created_at"] or now())
+    return {
+        "paymentId": r["reference"],
+        "reference": r["reference"],
+        "status": r["status"],
+        "payCurrency": coin,
+        "currency": "USD",
+        "network": coin,
+        "payAddress": addr,
+        "address": addr,
+        "payAmount": f"{usd:.2f}",
+        "amount": int(round(usd * 100)),
+        "expiresAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created + 3600)),
+    }
 
 @app.post("/api/payments/crypto/create")
 def deposit_crypto(data: CryptoIn, user: dict = Depends(get_current_user)):
-    if data.amount <= 0: raise ApiError(400, "Invalid amount")
+    new_dialect = data.payCurrency is not None or isinstance(data.amount, str)
+    try:
+        raw = float(data.amount)
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid amount")
+    usd = raw / 100.0 if new_dialect else raw
+    if usd <= 0:
+        raise ApiError(400, "Invalid amount")
+    coin = (data.payCurrency or data.currency or "BTC").upper()
     conn = db()
     mins = json.loads(get_setting(conn, "min_deposits"))
-    if data.amount < mins.get("crypto", 10):
+    minimum = mins.get("crypto", 10)
+    if usd < minimum:
         conn.close()
-        raise ApiError(400, f"Minimum deposit is ${mins.get('crypto', 10)}")
-    mp = json.loads(get_setting(conn, "manual_payments"))
-    addr = mp.get("bitcoin", "bc1qphantomdead")
-    if data.currency == "ETH": addr = mp.get("ethereum", "0xph")
-    elif data.currency == "LTC": addr = mp.get("litecoin", "ltc1qph")
-    ref = secrets.token_hex(4).upper()
+        raise ApiError(400, f"Minimum deposit is ${minimum}")
+    addr = crypto_address(conn, coin)
+    ref = secrets.token_hex(8) if new_dialect else _deposit_ref()
     conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
-                 (user["id"], f"crypto:{data.currency}", data.amount, ref, "pending", now()))
+                 (user["id"], f"crypto:{coin}", usd, ref, "pending", now()))
     conn.commit()
-    tg_notify(f"[{SITE}] Crypto deposit req {ref} by {user['email']}: ${data.amount}")
+    tg_notify(f"[{SITE}] Crypto deposit req {ref} by {user['email']}: ${usd}")
+    row = conn.execute("SELECT * FROM deposits WHERE reference=?", (ref,)).fetchone()
     conn.close()
-    return {"address": addr, "amount": data.amount, "currency": data.currency, "reference": ref,
+    if new_dialect:
+        return _crypto_tracking(row)
+    return {"address": addr, "amount": usd, "currency": coin, "reference": ref,
             "status": "pending", "expiresAt": ts(now() + 3600)}
 
 @app.get("/api/payments/crypto/currencies")
 def crypto_currencies():
-    return [{"symbol": "BTC", "min": 10}, {"symbol": "ETH", "min": 10},
-            {"symbol": "LTC", "min": 10}, {"symbol": "USDT", "min": 10}]
+    return {"currencies": list(CRYPTO_ADDRESS_KEY.keys())}
 
 @app.get("/api/payments/crypto/status")
 def crypto_status(user: dict = Depends(get_current_user)):
@@ -734,10 +912,27 @@ def crypto_status(user: dict = Depends(get_current_user)):
     return [{"id": r["id"], "method": r["method"], "amount": r["amount"], "reference": r["reference"],
              "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
 
-@app.get("/api/payments/crypto/{pid}/status")
-def crypto_payment_status(pid: int, user: dict = Depends(get_current_user)):
+def _find_crypto_deposit(conn, pid: str, user_id: int):
+    row = None
+    if str(pid).isdigit():
+        row = conn.execute("SELECT * FROM deposits WHERE id=? AND user_id=?", (int(pid), user_id)).fetchone()
+    if not row:
+        row = conn.execute("SELECT * FROM deposits WHERE reference=? AND user_id=?", (pid, user_id)).fetchone()
+    return row
+
+@app.get("/api/payments/crypto/{pid}")
+def crypto_payment_detail(pid: str, user: dict = Depends(get_current_user)):
     conn = db()
-    r = conn.execute("SELECT * FROM deposits WHERE id=? AND user_id=?", (pid, user["id"])).fetchone()
+    r = _find_crypto_deposit(conn, pid, user["id"])
+    conn.close()
+    if not r:
+        raise ApiError(404, "Not found")
+    return _crypto_tracking(r)
+
+@app.get("/api/payments/crypto/{pid}/status")
+def crypto_payment_status(pid: str, user: dict = Depends(get_current_user)):
+    conn = db()
+    r = _find_crypto_deposit(conn, pid, user["id"])
     conn.close()
     if not r:
         raise ApiError(404, "Not found")
@@ -749,8 +944,7 @@ def my_deposits(user: dict = Depends(get_current_user)):
     conn = db()
     rows = conn.execute("SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
     conn.close()
-    return [{"id": r["id"], "method": r["method"], "amount": r["amount"], "reference": r["reference"],
-             "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+    return [deposit_out(r) for r in rows]
 
 # ================= CARDS + CHECKER (PHASE C) =================
 @app.get("/api/card-bases")
@@ -1167,8 +1361,7 @@ def admin_deposits(user: dict = Depends(get_current_user)):
     rows = conn.execute("""SELECT d.*, u.email FROM deposits d JOIN users u ON u.id=d.user_id
                            ORDER BY d.id DESC""").fetchall()
     conn.close()
-    return [{"id": r["id"], "email": r["email"], "method": r["method"], "amount": r["amount"],
-             "reference": r["reference"], "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+    return [deposit_out(r, r["email"]) for r in rows]
 
 @app.post("/api/admin/deposits/{did}/approve")
 def approve_deposit(did: int, user: dict = Depends(get_current_user)):
@@ -1461,14 +1654,23 @@ class ForgotIn(BaseModel):
 def password_forgot(data: ForgotIn):
     conn = db()
     u = conn.execute("SELECT * FROM users WHERE email=?", (data.email,)).fetchone()
+    sent = False
     if u:
         code = str(random.randint(100000, 999999))
         conn.execute("INSERT OR REPLACE INTO password_resets(email,code,expires,used) VALUES(?,?,?,0)",
                      (data.email, code, now() + 900))
-        print(f"[{SITE}] reset code for {data.email}: {code}")
+        sent = send_reset_email(data.email, code)
+        audit("pw_reset_request", data.email, f"email_sent={sent}")
+        tg_notify(f"[{SITE}] Password reset code for {data.email}: {code}")
         conn.commit()
+        print(f"[{SITE}] reset code for {data.email}: {code}")
     conn.close()
-    return {"message": "If the email exists, a reset code was issued"}
+    resp = {"message": "If the email exists, a reset code was issued"}
+    if sent:
+        resp["delivered"] = "email"
+    elif RESET_DEV_CODE and u:
+        resp["devCode"] = code   # local/dev convenience only; set RESET_DEV_CODE=false in production
+    return resp
 
 class ResetIn(BaseModel):
     email: str
@@ -1665,7 +1867,12 @@ def admin_get_min_deposits(user: dict = Depends(get_current_user)):
 def admin_set_min_deposits(payload: Dict[str, Any], user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    set_setting(conn, "min_deposits", json.dumps(payload))
+    if "method" in payload and "min" in payload:
+        data = _json_setting(conn, "min_deposits", {}) or {}
+        data[payload["method"]] = float(payload["min"])
+    else:
+        data = payload
+    set_setting(conn, "min_deposits", json.dumps(data))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -1820,10 +2027,53 @@ def worker_orders(user: dict = Depends(get_current_user)):
     return [{"id": r["id"], "email": r["email"], "variantId": r["variant_id"], "quantity": r["quantity"],
              "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
 
+@app.get("/api/admin/settings/{key}")
+def admin_get_setting(key: str, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if key in MANUAL_SETTING_KEY.values():
+        method = key.rsplit("-", 1)[0]
+        field = MANUAL_HANDLE_FIELD.get(method, "handle")
+        val = manual_payments_public(conn).get(method, {}).get(field, "")
+        conn.close()
+        return {field: val}
+    if key.endswith("-fee"):
+        try:
+            fee = float(_json_setting(conn, key, 0) or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+        conn.close()
+        return {"fee": fee}
+    conn.close()
+    raise ApiError(404, "Unknown setting")
+
+@app.post("/api/admin/settings/{key}")
+def admin_set_setting(key: str, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if key in MANUAL_SETTING_KEY.values():
+        field = "tag" if key.endswith("-tag") else "handle"
+        val = str(payload.get(field) or payload.get("handle") or payload.get("tag") or "")
+        set_setting(conn, key, json.dumps(val))
+        conn.commit(); conn.close()
+        audit("setting_set", user["email"], f"{key}={val}")
+        return {"ok": True}
+    if key.endswith("-fee"):
+        try:
+            fee = float(payload.get("fee", 0) or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
+        set_setting(conn, key, json.dumps(fee))
+        conn.commit(); conn.close()
+        audit("setting_set", user["email"], f"{key}={fee}")
+        return {"ok": True}
+    conn.close()
+    raise ApiError(404, "Unknown setting")
+
 # ================= STATIC (mount LAST) =================
 app.mount("/uploads", StaticFiles(directory=UPLOADS), name="uploads")
 app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="spa")
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
