@@ -11,6 +11,8 @@ services:
       mountPath: /var/data
       sizeGB: 1
     envVars:
+      - key: DATABASE_URL
+        sync: false
       - key: DATA_DIR
         value: /var/data
       - key: COOKIE_SECURE

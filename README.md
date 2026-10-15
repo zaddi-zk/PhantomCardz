@@ -5,10 +5,11 @@ card bases, manage a wallet, play provably-random games (dice, spin, mines,
 plinko), and check purchased cards. Admins manage products, stock, deposits,
 users, discount codes, announcements, and support tickets.
 
-The project is a **FastAPI + SQLite backend** (`main.py`) serving a **frozen React
-SPA** (`frontend/`). The SPA authenticates with **HttpOnly session cookies**; the
-API also accepts **`Authorization: Bearer <token>`** for programmatic clients, so
-it speaks both dialects.
+The project is a **FastAPI backend** (`main.py`) serving a **frozen React SPA**
+(`frontend/`). It stores data in **SQLite** by default and switches to **PostgreSQL
+(Supabase)** when `DATABASE_URL` is set. The SPA authenticates with **HttpOnly
+session cookies**; the API also accepts **`Authorization: Bearer <token>`** for
+programmatic clients, so it speaks both dialects.
 
 ## Requirements
 
@@ -25,7 +26,28 @@ tools/fullcheck.sh # full endpoint walker + money-integrity glitch probes
 tools/backup.sh    # hot-backup market.db -> backups/market-<stamp>.db.gz (keeps last 14)
 ```
 
-`market.db` is created and seeded on first run if missing.
+`market.db` is created and seeded on first run if missing (SQLite mode).
+
+## Database — SQLite or Supabase PostgreSQL
+
+The database is selected by the **`DATABASE_URL`** environment variable:
+
+- **unset** → SQLite at `DATA_DIR/market.db` (default; ideal for local dev);
+- **`postgres://` / `postgresql://` URL** → PostgreSQL. Point it at the Supabase
+  **Session pooler** URI (IPv4-compatible), kept secret, e.g.
+  `postgresql://postgres.<ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres?sslmode=require`.
+
+The schema auto-creates and seeds on an empty database. To copy an existing
+`market.db` into an empty Supabase database **once**:
+
+```bash
+DATABASE_URL="postgresql://...?...sslmode=require" \
+  python tools/migrate_sqlite_to_postgres.py --source market.db
+```
+
+The migrator maps the app's camelCase columns to their lowercase Postgres names,
+resets the id sequences, and refuses to run into a non-empty database. See
+[`docs/DEPLOY-RENDER.md`](docs/DEPLOY-RENDER.md) for the full Supabase + Render setup.
 
 ## Admin login
 
@@ -45,6 +67,7 @@ edit. `.env` is git-ignored; `.env.example` is committed.
 
 | Key              | Effect                                                        | Default                                                          |
 |------------------|---------------------------------------------------------------|------------------------------------------------------------------|
+| `DATABASE_URL`   | SQLite when blank; PostgreSQL (Supabase) when a `postgres://` URL | *(empty → `market.db`)*                                      |
 | `SITE_NAME`      | Brand name in titles/announcements                            | `PhantomCardz`                                                   |
 | `ADMIN_EMAIL`    | Admin account seeded on a **fresh** DB                         | `admin@phantomcardz.cc`                                          |
 | `ADMIN_PASSWORD` | Admin password seeded on a **fresh** DB                        | `Boss123!`                                                       |
@@ -83,7 +106,8 @@ Keeps the 14 most recent archives. Back up `uploads/` separately if you allow up
 
 ```
 /home/milo/PhantomCardz/
-├── main.py            # FastAPI backend — all routes, SQLite schema, cookie+token auth
+├── main.py            # FastAPI backend — all routes, schema, cookie+token auth
+├── database.py        # SQLite/PostgreSQL compatibility layer (DATABASE_URL switch)
 ├── market.db          # SQLite database (auto-created/seeded) — git-ignored
 ├── market.log         # runtime log (git-ignored)
 ├── .env               # local config (git-ignored); see .env.example
@@ -96,6 +120,7 @@ Keeps the 14 most recent archives. Back up `uploads/` separately if you allow up
 │   ├── stop.sh        # stop the server
 │   ├── smoke.sh       # auth + regression smoke test (PASS/FAIL per check)
 │   ├── fullcheck.sh   # full endpoint walker + money-integrity probes
+│   ├── migrate_sqlite_to_postgres.py  # one-shot market.db -> Supabase copy
 │   └── backup.sh      # sqlite3 hot backup -> backups/*.db.gz
 ├── backups/           # generated DB backups (git-ignored)
 ├── logs/              # audit.log (git-ignored)

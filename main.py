@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PhantomCardz — cards & accounts marketplace backend (FastAPI + SQLite)."""
-import os, sqlite3, secrets, random, time, hashlib, string, json
+import os, secrets, random, time, hashlib, string, json
 import smtplib
 from email.message import EmailMessage
 from contextlib import asynccontextmanager
@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from database import INTEGRITY_ERRORS, connect_db, insert_id
 
 APP_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("DATA_DIR", APP_ROOT)          # Render: mount path of persistent disk
@@ -59,11 +60,7 @@ class ApiError(Exception):
         self.message = message
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.row_factory = sqlite3.Row
-    return conn
+    return connect_db(DB_PATH)
 
 def h(pw: str, salt: str) -> str:
     dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000)
@@ -258,14 +255,7 @@ def luhn_generate(length: int = 16) -> str:
     digits.append((10 - (total % 10)) % 10)
     return "".join(map(str, digits))
 
-def init_db():
-    conn = db()
-    conn.executescript(SCHEMA)
-    user_columns = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
-    if "username" not in user_columns:
-        conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
-    conn.executescript("""
+INDEX_SCHEMA = """
     CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
     CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
     CREATE INDEX IF NOT EXISTS idx_stock_variant ON stock_items(variant_id, sold);
@@ -274,7 +264,18 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id);
     CREATE INDEX IF NOT EXISTS idx_gamehist_user ON game_history(user_id);
     CREATE INDEX IF NOT EXISTS idx_products_active ON products(active, pinned);
-    """)
+"""
+
+def ensure_schema(conn):
+    conn.executescript(SCHEMA)
+    conn.executescript(INDEX_SCHEMA)
+    if "username" not in conn.table_columns("users"):
+        conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
+
+def init_db():
+    conn = db()
+    ensure_schema(conn)
     c = conn.cursor()
     if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
         c.execute("INSERT INTO users(email,password_hash,telegram,balance,rank,created_at) VALUES(?,?,?,?,?,?)",
@@ -294,19 +295,16 @@ def init_db():
             ("Combo Lists", "Fresh combo lists for cracking.", 0, "Combos (10k lines)", 10.0, 50),
         ]
         for name, desc, pinned, vname, price, n in seeds:
-            c.execute("INSERT INTO products(name,description,image,active,pinned,owner_id,created_at) VALUES(?,?,?,1,?,1,?)",
-                      (name, desc, "/api/images/1", pinned, now()))
-            pid = c.lastrowid
-            c.execute("INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,1,?)",
-                      (pid, vname, price, now()))
-            vid = c.lastrowid
+            pid = insert_id(c, "INSERT INTO products(name,description,image,active,pinned,owner_id,created_at) VALUES(?,?,?,1,?,1,?)",
+                            (name, desc, "/api/images/1", pinned, now()))
+            vid = insert_id(c, "INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,1,?)",
+                            (pid, vname, price, now()))
             for _ in range(n):
                 c.execute("INSERT INTO stock_items(variant_id,content,created_at) VALUES(?,?,?)",
                           (vid, f"{rand_str(7)}@hotmail.com:{rand_str(10).capitalize()}1!", now()))
     if c.execute("SELECT COUNT(*) FROM card_bases").fetchone()[0] == 0:
         for name, price in [("US Classic", 5.0), ("Premium Mix", 12.0)]:
-            c.execute("INSERT INTO card_bases(name,price,active) VALUES(?,?,1)", (name, price))
-            bid = c.lastrowid
+            bid = insert_id(c, "INSERT INTO card_bases(name,price,active) VALUES(?,?,1)", (name, price))
             for _ in range(20):
                 c.execute("INSERT INTO cards(base_id,number,exp_month,exp_year,cvv) VALUES(?,?,?,?,?)",
                           (bid, luhn_generate(16), random.randint(1, 12),
@@ -325,7 +323,7 @@ def init_db():
                                        "venmo": False, "zelle": False, "chime": True, "applepay": False}),
     }
     for k, v in defaults.items():
-        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+        c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (k, v))
     conn.commit()
     conn.close()
 
@@ -454,7 +452,7 @@ def register(request: Request, data: RegisterIn):
         resp.set_cookie(key="session", value=token, httponly=True, secure=COOKIE_SECURE,
                         samesite="lax", path="/", max_age=7 * 24 * 3600)
         return resp
-    except sqlite3.IntegrityError:
+    except INTEGRITY_ERRORS:
         conn.close()
         raise ApiError(400, "Email already exists")
 
@@ -679,8 +677,10 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
     if not v:
         conn.close()
         raise ApiError(404, "Not found")
-    stock = conn.execute("SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?",
-                         (data.variantId, data.quantity)).fetchall()
+    stock_query = "SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?"
+    if conn.is_postgres:
+        stock_query += " FOR UPDATE SKIP LOCKED"
+    stock = conn.execute(stock_query, (data.variantId, data.quantity)).fetchall()
     if len(stock) < data.quantity:
         conn.close()
         raise ApiError(400, "Insufficient stock")
@@ -704,10 +704,10 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
         conn.rollback(); conn.close()
         raise ApiError(400, "Insufficient balance")
     items = [s["content"] for s in claimed]
-    cur = conn.execute(
+    oid = insert_id(
+        conn,
         "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
         (user["id"], data.variantId, data.quantity, total, "completed", json.dumps(items), now()))
-    oid = cur.lastrowid
     for s in claimed:
         conn.execute("UPDATE stock_items SET order_id=? WHERE id=?", (oid, s["id"]))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
@@ -1100,9 +1100,9 @@ def game_mines(data: MinesIn, user: dict = Depends(get_current_user)):
             conn.rollback(); conn.close()
             raise ApiError(400, "Insufficient balance")
         mm = random.sample(range(25), data.mines)
-        gid = conn.execute("""INSERT INTO games_mines(user_id,mines,amount,safe_picks,mines_map,opened,active,created_at)
-                        VALUES(?,?,?,?,?,?,1,?)""",
-                      (user["id"], data.mines, data.amount, 0, json.dumps(mm), json.dumps([]), now())).lastrowid
+        gid = insert_id(conn, """INSERT INTO games_mines(user_id,mines,amount,safe_picks,mines_map,opened,active,created_at)
+                VALUES(?,?,?,?,?,?,1,?)""",
+                (user["id"], data.mines, data.amount, 0, json.dumps(mm), json.dumps([]), now()))
         u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
         conn.commit(); conn.close()
         return {"gameId": gid, "status": "started", "mines": data.mines,
@@ -1280,8 +1280,8 @@ class ProductIn(BaseModel):
 def admin_add_product(data: ProductIn, user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    pid = conn.execute("INSERT INTO products(name,description,image,active,pinned,owner_id,created_at) VALUES(?,?,?,1,?,?,?)",
-                 (data.name, data.description, data.image, data.pinned, user["id"], now())).lastrowid
+    pid = insert_id(conn, "INSERT INTO products(name,description,image,active,pinned,owner_id,created_at) VALUES(?,?,?,1,?,?,?)",
+                    (data.name, data.description, data.image, data.pinned, user["id"], now()))
     conn.commit(); conn.close()
     return {"id": pid, "ok": True}
 
@@ -1316,8 +1316,8 @@ class VariantIn(BaseModel):
 def admin_add_variant(pid: int, data: VariantIn, user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    vid = conn.execute("INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,1,?)",
-                 (pid, data.name, data.price, now())).lastrowid
+    vid = insert_id(conn, "INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,1,?)",
+                    (pid, data.name, data.price, now()))
     conn.commit(); conn.close()
     return {"id": vid, "ok": True}
 
@@ -1422,7 +1422,7 @@ class DiscountCodeIn(BaseModel):
 def admin_add_discount(data: DiscountCodeIn, user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    conn.execute("INSERT OR IGNORE INTO discount_codes(code,percent,active) VALUES(?,?,1)",
+    conn.execute("INSERT INTO discount_codes(code,percent,active) VALUES(?,?,1) ON CONFLICT(code) DO NOTHING",
                  (data.code.upper(), data.percent))
     conn.commit(); conn.close()
     return {"ok": True}
@@ -1537,7 +1537,7 @@ class CodeIn(BaseModel):
 def admin_add_code(data: CodeIn, user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    conn.execute("INSERT OR IGNORE INTO wallet_codes(code,value,used,created_at) VALUES(?,?,0,?)",
+    conn.execute("INSERT INTO wallet_codes(code,value,used,created_at) VALUES(?,?,0,?) ON CONFLICT(code) DO NOTHING",
                  (data.code.upper(), data.value, now()))
     conn.commit(); audit("code_add", user["email"], f"{data.code}=${data.value}"); conn.close()
     return {"ok": True}
@@ -1599,8 +1599,8 @@ class TicketIn(BaseModel):
 @app.post("/api/support")
 def create_ticket(data: TicketIn, user: dict = Depends(get_current_user)):
     conn = db()
-    tid = conn.execute("INSERT INTO tickets(user_id,subject,body,status,created_at) VALUES(?,?,?,'open',?)",
-                 (user["id"], data.subject, data.body, now())).lastrowid
+    tid = insert_id(conn, "INSERT INTO tickets(user_id,subject,body,status,created_at) VALUES(?,?,?,'open',?)",
+                    (user["id"], data.subject, data.body, now()))
     conn.commit(); tg_notify(f"[{SITE}] Ticket #{tid} from {user['email']}: {data.subject}"); conn.close()
     return {"id": tid, "status": "open"}
 
@@ -1657,7 +1657,8 @@ def password_forgot(data: ForgotIn):
     sent = False
     if u:
         code = str(random.randint(100000, 999999))
-        conn.execute("INSERT OR REPLACE INTO password_resets(email,code,expires,used) VALUES(?,?,?,0)",
+        conn.execute("INSERT INTO password_resets(email,code,expires,used) VALUES(?,?,?,0) "
+                 "ON CONFLICT(email,code) DO UPDATE SET expires=excluded.expires,used=0",
                      (data.email, code, now() + 900))
         sent = send_reset_email(data.email, code)
         audit("pw_reset_request", data.email, f"email_sent={sent}")
@@ -1762,16 +1763,17 @@ def order_crypto(data: CryptoOrderIn, user: dict = Depends(get_current_user)):
     if not v:
         conn.close()
         raise ApiError(404, "Not found")
-    stock = conn.execute("SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?",
-                         (data.variantId, data.quantity)).fetchall()
+    stock_query = "SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?"
+    if conn.is_postgres:
+        stock_query += " FOR UPDATE SKIP LOCKED"
+    stock = conn.execute(stock_query, (data.variantId, data.quantity)).fetchall()
     if len(stock) < data.quantity:
         conn.close()
         raise ApiError(400, "Insufficient stock")
     total = round(v["price"] * data.quantity, 2)
     items = [s["content"] for s in stock]
-    cur = conn.execute("INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
-                       (user["id"], data.variantId, data.quantity, total, "pending_payment", json.dumps(items), now()))
-    oid = cur.lastrowid
+    oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (user["id"], data.variantId, data.quantity, total, "pending_payment", json.dumps(items), now()))
     for s in stock:
         conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=?", (oid, s["id"]))
     mp = json.loads(get_setting(conn, "manual_payments"))
