@@ -20,7 +20,8 @@ it speaks both dialects.
 ```bash
 tools/start.sh     # (re)start the API on http://0.0.0.0:8000, logs to market.log
 tools/stop.sh      # stop the API
-tools/smoke.sh     # run the auth + regression checks against the running server
+tools/smoke.sh     # auth + regression smoke test (PASS/FAIL per check)
+tools/fullcheck.sh # full endpoint walker + money-integrity glitch probes
 tools/backup.sh    # hot-backup market.db -> backups/market-<stamp>.db.gz (keeps last 14)
 ```
 
@@ -54,6 +55,8 @@ edit. `.env` is git-ignored; `.env.example` is committed.
 | `LTC_ADDRESS`    | Default LTC address in `manual_payments` defaults             | `ltc1qphantom…dead`                                              |
 | `ALLOWED_HOSTS`  | TrustedHost + CORS allow-list (comma-separated)               | `phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1`        |
 | `COOKIE_SECURE`  | Set `session` cookie `Secure` flag (requires HTTPS)           | `false`                                                          |
+| `TELEGRAM_BOT_TOKEN` | Bot token for order/deposit/ticket notifications (blank = off) | *(empty)*                                                    |
+| `TELEGRAM_CHAT_ID`  | Telegram chat id that receives notifications                  | *(empty)*                                                        |
 
 **These values only apply to fresh tables/defaults.** On an existing `market.db`,
 changing `ADMIN_PASSWORD` in `.env` has no effect — rotate the admin password via
@@ -92,6 +95,7 @@ Keeps the 14 most recent archives. Back up `uploads/` separately if you allow up
 │   ├── start.sh       # start the server
 │   ├── stop.sh        # stop the server
 │   ├── smoke.sh       # auth + regression smoke test (PASS/FAIL per check)
+│   ├── fullcheck.sh   # full endpoint walker + money-integrity probes
 │   └── backup.sh      # sqlite3 hot backup -> backups/*.db.gz
 ├── backups/           # generated DB backups (git-ignored)
 ├── logs/              # audit.log (git-ignored)
@@ -125,6 +129,58 @@ Keeps the 14 most recent archives. Back up `uploads/` separately if you allow up
   `/api/*` and `/uploads/*` 404s stay JSON.
 - **Audit trail**: admin/register/clear actions appended to `logs/audit.log`.
 - **Indexes**: hot lookup paths indexed in `init_db`.
+
+## Admin Panel
+
+Log in as the admin (see below) and open **`/admin`** in the SPA. The panel exposes
+dashboard, users (rank/balance/telegram), products, variants, stock, deposits
+(approve/reject), orders, card bases, cards, wallet codes, discount codes,
+announcements, payment methods, site settings (addresses/minimums), maintenance
+mode, and support tickets.
+
+## Telegram notifications (optional)
+
+Order/deposit/ticket/register events are pushed to Telegram when configured:
+
+1. Talk to **@BotFather** on Telegram → `/newbot` → copy the bot token.
+2. Message your new bot once (so it can DM you), then get your chat id from
+   `https://api.telegram.org/bot<TOKEN>/getUpdates` (`result[].message.chat.id`).
+3. Put both into `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=123456:ABC...
+   TELEGRAM_CHAT_ID=123456789
+   ```
+4. Restart: `tools/stop.sh && tools/start.sh`.
+
+Notifications are fire-and-forget (never block or fail a request). Without the keys,
+`tg_notify` is a no-op.
+
+## Restocking workflows
+
+- **Cards (card bases)**: Admin Panel → card bases → add base (`POST /api/admin/card-bases`
+  `{name, price}`), then bulk-import inventory via **license-file**:
+  `curl -F "file=@lic.txt" ".../api/admin/stock/license-file?baseId=<id>"` where the
+  file has one card per line, `number|mm|yyyy|cvv` or `number:mm:yyyy:cvv`.
+- **Products/accounts**: Admin Panel → products → create product
+  (`POST /api/admin/products`), add variants (`POST /api/admin/products/{id}/variants`
+  `{name, price}`), then bulk-load stock lines
+  (`POST /api/admin/stock/bulk` `{variantId, contents}` — one item per line, e.g.
+  `email:password`).
+
+## Money-integrity protections
+
+- **Negative-amount gates**: deposits, games (dice/spin/plinko/mines-start), orders
+  and crypto-checkout reject `amount <= 0` / invalid `variantId` with 400.
+- **Atomic mutations**: every money path enforces its precondition in the SQL UPDATE
+  itself and checks `rowcount == 1`, rolling back otherwise —
+  deposit approval (`WHERE status='pending'`), wallet-code redemption
+  (`WHERE used=0`), card purchase (`WHERE sold=0` + balance check),
+  order stock claims (`WHERE sold=0` per item), mines cashout
+  (`WHERE active=1`), and the Telegram daily claim (`WHERE last_claim < today`).
+  Double-approve / double-redeem / double-cashout return 400 and change nothing.
+- **Audited retries**: money-relevant admin actions (deposit approve/reject, code add,
+  user patch/delete, redeem, register, clear-all) append to `logs/audit.log`, so a
+  failed or repeated attempt can be traced after the fact.
 
 ## Deployment
 

@@ -556,8 +556,8 @@ class OrderIn(BaseModel):
 
 @app.post("/api/orders")
 def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
-    if data.quantity < 1:
-        raise ApiError(400, "Invalid quantity")
+    if data.quantity < 1 or data.variantId <= 0:
+        raise ApiError(400, "Invalid order")
     conn = db()
     v = conn.execute("SELECT * FROM variants WHERE id=?", (data.variantId,)).fetchone()
     if not v:
@@ -574,21 +574,30 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
         if d:
             total = total * (1 - d["percent"] / 100.0)
     total = round(total, 2)
+    claimed = []
+    for s in stock:
+        cur = conn.execute("UPDATE stock_items SET sold=1, order_id=NULL WHERE id=? AND sold=0", (s["id"],))
+        if cur.rowcount == 1:
+            claimed.append(s)
+    if len(claimed) < data.quantity:
+        conn.rollback(); conn.close()
+        raise ApiError(400, "Insufficient stock")
     cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
                        (total, user["id"], total))
     if cur.rowcount != 1:
-        conn.rollback()
-        conn.close()
+        conn.rollback(); conn.close()
         raise ApiError(400, "Insufficient balance")
-    items = [s["content"] for s in stock]
-    oid = conn.execute("INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
-                       (user["id"], data.variantId, data.quantity, total, "completed", json.dumps(items), now())).lastrowid
-    for s in stock:
-        conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=?", (oid, s["id"]))
+    items = [s["content"] for s in claimed]
+    cur = conn.execute(
+        "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
+        (user["id"], data.variantId, data.quantity, total, "completed", json.dumps(items), now()))
+    oid = cur.lastrowid
+    for s in claimed:
+        conn.execute("UPDATE stock_items SET order_id=? WHERE id=?", (oid, s["id"]))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit()
-    tg_notify(f"[{SITE}] ORDER #{oid} by {user['email']}: {data.quantity}x variant {data.variantId} = ${total}")
     conn.close()
+    tg_notify(f"[{SITE}] ORDER #{oid} by {user['email']}: {data.quantity}x variant {data.variantId} = ${total}")
     return {"id": oid, "items": items, "total": total, "newBalance": round(u["balance"], 2)}
 
 @app.get("/api/orders")
@@ -641,15 +650,19 @@ class RedeemIn(BaseModel):
 @app.post("/api/wallet/redeem")
 def redeem(data: RedeemIn, user: dict = Depends(get_current_user)):
     conn = db()
-    r = conn.execute("SELECT * FROM wallet_codes WHERE code=? AND used=0", (data.code.upper(),)).fetchone()
+    r = conn.execute("SELECT * FROM wallet_codes WHERE code=?", (data.code.upper(),)).fetchone()
     if not r:
         conn.close()
         raise ApiError(400, "Invalid code")
-    conn.execute("UPDATE wallet_codes SET used=1 WHERE id=?", (r["id"],))
+    cur = conn.execute("UPDATE wallet_codes SET used=1 WHERE id=? AND used=0", (r["id"],))
+    if cur.rowcount != 1:
+        conn.rollback(); conn.close()
+        raise ApiError(400, "Code already redeemed")
     conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (r["value"], user["id"]))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit()
     conn.close()
+    audit("redeem", user["email"], f"${r['value']}")
     return {"newBalance": round(u["balance"], 2), "redeemed": r["value"]}
 
 @app.get("/api/wallet/transactions")
@@ -667,6 +680,7 @@ class CashappIn(BaseModel):
 
 @app.post("/api/orders/cashapp")
 def deposit_cashapp(data: CashappIn, user: dict = Depends(get_current_user)):
+    if data.amount <= 0: raise ApiError(400, "Invalid amount")
     conn = db()
     mins = json.loads(get_setting(conn, "min_deposits"))
     if data.amount < mins.get("cashapp", 5):
@@ -688,6 +702,7 @@ class CryptoIn(BaseModel):
 
 @app.post("/api/payments/crypto/create")
 def deposit_crypto(data: CryptoIn, user: dict = Depends(get_current_user)):
+    if data.amount <= 0: raise ApiError(400, "Invalid amount")
     conn = db()
     mins = json.loads(get_setting(conn, "min_deposits"))
     if data.amount < mins.get("crypto", 10):
@@ -755,7 +770,7 @@ class BuyCardIn(BaseModel):
 @app.post("/api/cards")
 def buy_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
     conn = db()
-    b = conn.execute("SELECT * FROM card_bases WHERE id=?", (data.baseId,)).fetchone()
+    b = conn.execute("SELECT * FROM card_bases WHERE id=? AND active=1", (data.baseId,)).fetchone()
     if not b:
         conn.close()
         raise ApiError(404, "Not found")
@@ -764,13 +779,16 @@ def buy_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
     if not c:
         conn.close()
         raise ApiError(400, "Out of stock")
-    total = b["price"]
-    cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?", (total, user["id"], total))
+    cur = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0",
+                       (user["id"], c["id"]))
     if cur.rowcount != 1:
-        conn.rollback()
-        conn.close()
+        conn.rollback(); conn.close()
+        raise ApiError(400, "Card just sold, try again")
+    cur2 = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                        (b["price"], user["id"], b["price"]))
+    if cur2.rowcount != 1:
+        conn.rollback(); conn.close()
         raise ApiError(400, "Insufficient balance")
-    conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=?", (user["id"], c["id"]))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit()
     conn.close()
@@ -815,6 +833,7 @@ class DiceIn(BaseModel):
 
 @app.post("/api/games/dice")
 def game_dice(data: DiceIn, user: dict = Depends(get_current_user)):
+    if data.amount <= 0: raise ApiError(400, "Invalid amount")
     if not (2 <= data.guessOver <= 98):
         raise ApiError(400, "guessOver must be 2-98")
     conn = db()
@@ -840,6 +859,7 @@ class SpinIn(BaseModel):
 
 @app.post("/api/games/spin")
 def game_spin(data: SpinIn, user: dict = Depends(get_current_user)):
+    if data.amount <= 0: raise ApiError(400, "Invalid amount")
     symbols = ["Cherry", "Lemon", "Bell", "Seven", "Diamond"]
     weights = [40, 30, 15, 10, 5]
     pay = {"Cherry": 2, "Lemon": 3, "Bell": 5, "Seven": 10, "Diamond": 25}
@@ -870,6 +890,7 @@ class MinesIn(BaseModel):
 
 @app.post("/api/games/mines")
 def game_mines(data: MinesIn, user: dict = Depends(get_current_user)):
+    if data.action in ("start",) and data.amount <= 0: raise ApiError(400, "Invalid amount")
     conn = db()
     if data.action == "start":
         if not (1 <= data.mines <= 24):
@@ -927,9 +948,12 @@ def game_mines(data: MinesIn, user: dict = Depends(get_current_user)):
         if safe < 1:
             conn.close()
             raise ApiError(400, "Pick at least one safe tile first")
+        cur = conn.execute("UPDATE games_mines SET active=0 WHERE id=? AND active=1", (g["id"],))
+        if cur.rowcount != 1:
+            conn.rollback(); conn.close()
+            raise ApiError(400, "Game already finished")
         mult = 0.97 * ((25.0 / (25 - g["mines"])) ** safe)
         payout = round(g["amount"] * mult, 2)
-        conn.execute("UPDATE games_mines SET active=0 WHERE id=?", (g["id"],))
         conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (payout, user["id"]))
         conn.execute("INSERT INTO game_history(user_id,game,amount,payout,created_at) VALUES(?,?,?,?,?)",
                      (user["id"], "mines", g["amount"], payout, now()))
@@ -946,6 +970,7 @@ class PlinkoIn(BaseModel):
 
 @app.post("/api/games/plinko")
 def game_plinko(data: PlinkoIn, user: dict = Depends(get_current_user)):
+    if data.amount <= 0: raise ApiError(400, "Invalid amount")
     tables = {
         "low":  [16, 9, 2, 1.4, 1.4, 1.2, 1.1, 1.0, 0.5, 1.0, 1.1, 1.2, 1.4, 1.4, 2, 9, 16],
         "high": [1000, 130, 26, 9, 4, 2, 0.2, 0.2, 0.2, 0.2, 0.2, 2, 4, 9, 26, 130, 1000],
@@ -1150,10 +1175,13 @@ def approve_deposit(did: int, user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
     d = conn.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
-    if not d or d["status"] != "pending":
+    if not d:
         conn.close()
+        raise ApiError(404, "Not found")
+    cur = conn.execute("UPDATE deposits SET status='approved' WHERE id=? AND status='pending'", (did,))
+    if cur.rowcount != 1:
+        conn.rollback(); conn.close()
         raise ApiError(400, "Not a pending deposit")
-    conn.execute("UPDATE deposits SET status='approved' WHERE id=?", (did,))
     if d["reference"] and d["reference"].startswith("ORD"):
         try:
             oid = int(d["reference"].split("-")[0][3:])
@@ -1474,14 +1502,14 @@ def tg_code(user: dict = Depends(get_current_user)):
 @app.post("/api/telegram/daily-rewards/link-code")
 def tg_claim(user: dict = Depends(get_current_user)):
     conn = db()
-    r = conn.execute("SELECT * FROM telegram_claims WHERE user_id=?", (user["id"],)).fetchone()
-    today = time.strftime("%Y-%m-%d")
-    if r and time.strftime("%Y-%m-%d", time.localtime(r["last_claim"])) == today:
-        conn.close()
-        raise ApiError(400, "Already claimed today")
-    if r:
-        conn.execute("UPDATE telegram_claims SET last_claim=? WHERE user_id=?", (now(), user["id"]))
-    else:
+    today_start = int(time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d")))
+    cur = conn.execute("UPDATE telegram_claims SET last_claim=? WHERE user_id=? AND last_claim<?",
+                       (now(), user["id"], today_start))
+    if cur.rowcount == 0:
+        ex = conn.execute("SELECT 1 FROM telegram_claims WHERE user_id=?", (user["id"],)).fetchone()
+        if ex:
+            conn.close()
+            raise ApiError(400, "Already claimed today")
         conn.execute("INSERT INTO telegram_claims(user_id,last_claim) VALUES(?,?)", (user["id"], now()))
     conn.execute("UPDATE users SET balance=balance+0.5 WHERE id=?", (user["id"],))
     conn.commit(); conn.close()
@@ -1525,6 +1553,8 @@ class CryptoOrderIn(BaseModel):
 def order_crypto(data: CryptoOrderIn, user: dict = Depends(get_current_user)):
     if data.quantity < 1:
         raise ApiError(400, "Invalid quantity")
+    if data.variantId <= 0:
+        raise ApiError(400, "Invalid variant")
     conn = db()
     v = conn.execute("SELECT * FROM variants WHERE id=?", (data.variantId,)).fetchone()
     if not v:
