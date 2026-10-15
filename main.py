@@ -37,6 +37,8 @@ ETH_ADDR     = os.getenv("ETH_ADDRESS", "0xPhantom000000000000000000000000000dea
 LTC_ADDR     = os.getenv("LTC_ADDRESS", "ltc1qphantom00000000000000000000dead")
 DOMAINS      = [d.strip() for d in os.getenv("ALLOWED_HOSTS", "phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1").split(",") if d.strip()]
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+TG_BOT  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
 security = HTTPBearer(auto_error=False)
 
@@ -80,6 +82,19 @@ LOGS = os.path.join(APP_ROOT, "logs"); os.makedirs(LOGS, exist_ok=True)
 def audit(event: str, actor: str = "-", detail: str = ""):
     with open(os.path.join(LOGS, "audit.log"), "a") as f:
         f.write(f"{now()} | {event} | {actor} | {detail}\n")
+
+def tg_notify(text: str):
+    if not (TG_BOT and TG_CHAT):
+        return
+    try:
+        import urllib.request, urllib.parse as _up, threading
+        def _send():
+            url = f"https://api.telegram.org/bot{TG_BOT}/sendMessage"
+            data = _up.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
+            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+        threading.Thread(target=_send, daemon=True).start()
+    except Exception:
+        pass
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -281,6 +296,17 @@ app.add_middleware(CORSMiddleware,
     allow_origins=[f"https://{d}" for d in DOMAINS] + [f"http://{d}" for d in DOMAINS] + ["http://localhost:8000"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+@app.middleware("http")
+async def maintenance_gate(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/api") and path not in ("/api/health", "/api/health/", "/api/login", "/api/admin/settings/maintenance"):
+        conn = db()
+        m = get_setting(conn, "maintenance", "0")
+        conn.close()
+        if m == "1":
+            return JSONResponse({"message": "Maintenance mode, back soon"}, status_code=503)
+    return await call_next(request)
+
 @app.exception_handler(ApiError)
 async def on_api_error(request, exc: ApiError):
     return JSONResponse({"message": exc.message}, status_code=exc.status)
@@ -373,6 +399,7 @@ def register(request: Request, data: RegisterIn):
         token = create_token(conn, u["id"])
         conn.commit()
         audit("register", data.email)
+        tg_notify(f"[{SITE}] New user: {data.email}")
         conn.close()
         resp = JSONResponse({"token": token, "user": user_out(u)})
         resp.set_cookie(key="session", value=token, httponly=True, secure=COOKIE_SECURE,
@@ -560,6 +587,7 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
         conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=?", (oid, s["id"]))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit()
+    tg_notify(f"[{SITE}] ORDER #{oid} by {user['email']}: {data.quantity}x variant {data.variantId} = ${total}")
     conn.close()
     return {"id": oid, "items": items, "total": total, "newBalance": round(u["balance"], 2)}
 
@@ -649,6 +677,7 @@ def deposit_cashapp(data: CashappIn, user: dict = Depends(get_current_user)):
     conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
                  (user["id"], "cashapp", data.amount, ref, "pending", now()))
     conn.commit()
+    tg_notify(f"[{SITE}] CashApp deposit req {ref} by {user['email']}: ${data.amount}")
     conn.close()
     return {"status": "pending", "reference": ref,
             "instructions": f"Send ${data.amount} via CashApp to {mp.get('cashapp','$PhantomCardz')} then message {ADMIN_TG} on Telegram with code {ref} and your email {user['email']}"}
@@ -672,6 +701,7 @@ def deposit_crypto(data: CryptoIn, user: dict = Depends(get_current_user)):
     conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
                  (user["id"], f"crypto:{data.currency}", data.amount, ref, "pending", now()))
     conn.commit()
+    tg_notify(f"[{SITE}] Crypto deposit req {ref} by {user['email']}: ${data.amount}")
     conn.close()
     return {"address": addr, "amount": data.amount, "currency": data.currency, "reference": ref,
             "status": "pending", "expiresAt": ts(now() + 3600)}
@@ -1124,16 +1154,35 @@ def approve_deposit(did: int, user: dict = Depends(get_current_user)):
         conn.close()
         raise ApiError(400, "Not a pending deposit")
     conn.execute("UPDATE deposits SET status='approved' WHERE id=?", (did,))
-    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
-    conn.commit(); audit("deposit_approve", user["email"], f"id={did} amount={d['amount']}"); conn.close()
+    if d["reference"] and d["reference"].startswith("ORD"):
+        try:
+            oid = int(d["reference"].split("-")[0][3:])
+            conn.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+        except Exception:
+            conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
+    else:
+        conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
+    conn.commit()
+    conn.close()
+    audit("deposit_approve", user["email"], f"id={did} amount={d['amount']}")
     return {"ok": True}
 
 @app.post("/api/admin/deposits/{did}/reject")
 def reject_deposit(did: int, user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
+    d = conn.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
+    if d and d["reference"] and d["reference"].startswith("ORD"):
+        try:
+            oid = int(d["reference"].split("-")[0][3:])
+            conn.execute("UPDATE stock_items SET sold=0, order_id=NULL WHERE sold=1 AND order_id=?", (oid,))
+            conn.execute("UPDATE orders SET status='cancelled' WHERE id=?", (oid,))
+        except Exception:
+            pass
     conn.execute("UPDATE deposits SET status='rejected' WHERE id=?", (did,))
-    conn.commit(); audit("deposit_reject", user["email"], f"id={did}"); conn.close()
+    conn.commit()
+    conn.close()
+    audit("deposit_reject", user["email"], f"id={did}")
     return {"ok": True}
 
 @app.get("/api/admin/discount-codes")
@@ -1331,7 +1380,7 @@ def create_ticket(data: TicketIn, user: dict = Depends(get_current_user)):
     conn = db()
     tid = conn.execute("INSERT INTO tickets(user_id,subject,body,status,created_at) VALUES(?,?,?,'open',?)",
                  (user["id"], data.subject, data.body, now())).lastrowid
-    conn.commit(); conn.close()
+    conn.commit(); tg_notify(f"[{SITE}] Ticket #{tid} from {user['email']}: {data.subject}"); conn.close()
     return {"id": tid, "status": "open"}
 
 @app.get("/api/support")
@@ -1446,6 +1495,300 @@ def upload(file: UploadFile = File(...), user: dict = Depends(get_current_user))
     with open(os.path.join(UPLOADS, name), "wb") as f:
         f.write(file.file.read())
     return {"url": f"/uploads/{name}"}
+
+# 1. single product (product detail page)
+@app.get("/api/products/{pid}")
+def product_get(pid: int):
+    conn = db()
+    r = conn.execute("SELECT * FROM products WHERE id=? AND active=1", (pid,)).fetchone()
+    if not r:
+        conn.close()
+        raise ApiError(404, "Not found")
+    vs = conn.execute("SELECT * FROM variants WHERE productId=?", (pid,)).fetchall()
+    vv = []
+    for v in vs:
+        sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0", (v["id"],)).fetchone()[0]
+        vv.append({"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
+                  "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": sc})
+    conn.close()
+    return {"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
+            "active": bool(r["active"]), "pinned": bool(r["pinned"]), "createdAt": ts(r["created_at"]),
+            "variants": vv}
+
+# 2. crypto CHECKOUT — reserves stock, links order to deposit, admin approval completes the order
+class CryptoOrderIn(BaseModel):
+    variantId: int
+    quantity: int = 1
+    currency: str = "BTC"
+
+@app.post("/api/orders/crypto")
+def order_crypto(data: CryptoOrderIn, user: dict = Depends(get_current_user)):
+    if data.quantity < 1:
+        raise ApiError(400, "Invalid quantity")
+    conn = db()
+    v = conn.execute("SELECT * FROM variants WHERE id=?", (data.variantId,)).fetchone()
+    if not v:
+        conn.close()
+        raise ApiError(404, "Not found")
+    stock = conn.execute("SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?",
+                         (data.variantId, data.quantity)).fetchall()
+    if len(stock) < data.quantity:
+        conn.close()
+        raise ApiError(400, "Insufficient stock")
+    total = round(v["price"] * data.quantity, 2)
+    items = [s["content"] for s in stock]
+    cur = conn.execute("INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
+                       (user["id"], data.variantId, data.quantity, total, "pending_payment", json.dumps(items), now()))
+    oid = cur.lastrowid
+    for s in stock:
+        conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=?", (oid, s["id"]))
+    mp = json.loads(get_setting(conn, "manual_payments"))
+    addr = mp.get("bitcoin", "bc1qph")
+    if data.currency == "ETH":
+        addr = mp.get("ethereum", "0x")
+    elif data.currency == "LTC":
+        addr = mp.get("litecoin", "ltc1q")
+    ref = f"ORD{oid}-{secrets.token_hex(3).upper()}"
+    conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
+                 (user["id"], f"crypto:{data.currency}", total, ref, "pending", now()))
+    conn.commit()
+    conn.close()
+    tg_notify(f"[{SITE}] CRYPTO ORDER #{oid} pending by {user['email']}: ${total}")
+    return {"orderId": oid, "address": addr, "amount": total, "currency": data.currency,
+            "reference": ref, "status": "pending"}
+
+# 3. public variants listing
+@app.get("/api/variants")
+def variants_list():
+    conn = db()
+    rows = conn.execute("SELECT * FROM variants").fetchall()
+    out = []
+    for v in rows:
+        sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0", (v["id"],)).fetchone()[0]
+        out.append({"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
+                    "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": sc})
+    conn.close()
+    return out
+
+# 4. user-side deposit management (cancel a pending one)
+@app.patch("/api/deposits/{did}")
+def user_patch_deposit(did: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    conn = db()
+    d = conn.execute("SELECT * FROM deposits WHERE id=? AND user_id=?", (did, user["id"])).fetchone()
+    if not d:
+        conn.close()
+        raise ApiError(404, "Not found")
+    status = d["status"]
+    if payload.get("status") == "cancelled" and d["status"] == "pending":
+        if d["reference"] and d["reference"].startswith("ORD"):
+            try:
+                oid = int(d["reference"].split("-")[0][3:])
+                conn.execute("UPDATE stock_items SET sold=0, order_id=NULL WHERE sold=1 AND order_id=?", (oid,))
+                conn.execute("UPDATE orders SET status='cancelled' WHERE id=?", (oid,))
+            except Exception:
+                pass
+        status = "cancelled"
+        conn.execute("UPDATE deposits SET status='cancelled' WHERE id=?", (did,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "status": status}
+
+# 5. user's single card detail
+@app.get("/api/cards/{cid}")
+def user_card(cid: int, user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT * FROM cards WHERE id=? AND buyer_id=?", (cid, user["id"])).fetchone()
+    conn.close()
+    if not r:
+        raise ApiError(404, "Not found")
+    return {"id": r["id"], "number": r["number"], "expMonth": r["exp_month"], "expYear": r["exp_year"],
+            "cvv": r["cvv"], "checked": bool(r["checked"]), "valid": r["valid"]}
+
+@app.get("/api/admin/orders")
+def admin_orders(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("""SELECT o.*, u.email FROM orders o JOIN users u ON u.id=o.user_id
+                           ORDER BY o.id DESC""").fetchall()
+    conn.close()
+    return [{"id": r["id"], "email": r["email"], "variantId": r["variant_id"], "quantity": r["quantity"],
+             "total": r["total"], "status": r["status"], "createdAt": ts(r["created_at"]),
+             "items": json.loads(r["items"] or "[]")} for r in rows]
+
+@app.get("/api/admin/settings/features")
+def admin_get_features(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    data = json.loads(get_setting(conn, "features"))
+    conn.close()
+    return data
+
+@app.get("/api/admin/settings/min-deposits")
+def admin_get_min_deposits(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    data = json.loads(get_setting(conn, "min_deposits"))
+    conn.close()
+    return data
+
+@app.post("/api/admin/settings/min-deposits")
+def admin_set_min_deposits(payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    set_setting(conn, "min_deposits", json.dumps(payload))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.patch("/api/admin/payment-methods/{name}")
+def admin_toggle_pm(name: str, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    data = json.loads(get_setting(conn, "payment_methods"))
+    data[name] = bool(payload.get("enabled", not data.get(name, False)))
+    set_setting(conn, "payment_methods", json.dumps(data))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+class CardBaseIn(BaseModel):
+    name: str
+    price: float
+
+@app.post("/api/admin/card-bases")
+def admin_add_base(data: CardBaseIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("INSERT INTO card_bases(name,price,active) VALUES(?,?,1)", (data.name, data.price))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.patch("/api/admin/card-bases/{bid}")
+def admin_patch_base(bid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if "name" in payload:
+        conn.execute("UPDATE card_bases SET name=? WHERE id=?", (payload["name"], bid))
+    if "price" in payload:
+        conn.execute("UPDATE card_bases SET price=? WHERE id=?", (payload["price"], bid))
+    if "active" in payload:
+        conn.execute("UPDATE card_bases SET active=? WHERE id=?", (1 if payload["active"] else 0, bid))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.delete("/api/admin/card-bases/{bid}")
+def admin_del_base(bid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("DELETE FROM cards WHERE base_id=?", (bid,))
+    conn.execute("DELETE FROM card_bases WHERE id=?", (bid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/cards")
+def admin_cards(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("""SELECT ca.*, cb.name AS base_name, bu.email AS buyer FROM cards ca
+        JOIN card_bases cb ON cb.id=ca.base_id
+        LEFT JOIN users bu ON bu.id=ca.buyer_id
+        ORDER BY ca.id DESC LIMIT 500""").fetchall()
+    conn.close()
+    return [{"id": r["id"], "base": r["base_name"], "number": r["number"], "expMonth": r["exp_month"],
+             "expYear": r["exp_year"], "cvv": r["cvv"], "sold": bool(r["sold"]), "buyer": r["buyer"],
+             "checked": bool(r["checked"]), "valid": r["valid"]} for r in rows]
+
+@app.patch("/api/admin/variants/{vid}")
+def admin_patch_variant(vid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if "name" in payload:
+        conn.execute("UPDATE variants SET name=? WHERE id=?", (payload["name"], vid))
+    if "price" in payload:
+        conn.execute("UPDATE variants SET price=? WHERE id=?", (payload["price"], vid))
+    if "minQuantity" in payload:
+        conn.execute("UPDATE variants SET minQuantity=? WHERE id=?", (payload["minQuantity"], vid))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.delete("/api/admin/variants/{vid}")
+def admin_del_variant(vid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("DELETE FROM stock_items WHERE variant_id=?", (vid,))
+    conn.execute("DELETE FROM variants WHERE id=?", (vid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/announcements/config")
+def admin_ann_config(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("SELECT bannerColor FROM announcements ORDER BY id DESC LIMIT 1").fetchall()
+    conn.close()
+    return {"bannerColor": rows[0]["bannerColor"] if rows else "#000000"}
+
+@app.post("/api/admin/settings/maintenance")
+def set_maintenance(payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    set_setting(conn, "maintenance", "1" if payload.get("enabled") else "0")
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+# license-file bulk card import (accepts number|mm|yyyy|cvv or number:mm:yyyy:cvv per line)
+@app.post("/api/admin/stock/license-file")
+async def admin_license_file(baseId: int, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    require_admin(user)
+    raw = (await file.read()).decode("utf-8", errors="ignore")
+    conn = db()
+    b = conn.execute("SELECT id FROM card_bases WHERE id=?", (baseId,)).fetchone()
+    if not b:
+        conn.close()
+        raise ApiError(404, "Not found")
+    added = 0
+    for line in raw.splitlines():
+        parts = [p.strip() for p in line.replace(":", "|").split("|")]
+        if len(parts) == 4 and parts[0].isdigit() and len(parts[0]) >= 13:
+            try:
+                conn.execute("INSERT INTO cards(base_id,number,exp_month,exp_year,cvv) VALUES(?,?,?,?,?)",
+                             (baseId, parts[0], int(parts[1]), int(parts[2]), parts[3]))
+                added += 1
+            except Exception:
+                pass
+    conn.commit()
+    conn.close()
+    return {"ok": True, "added": added}
+
+@app.get("/api/worker/card-bases")
+def worker_bases(user: dict = Depends(get_current_user)):
+    if user["rank"] not in ("admin", "worker"):
+        raise ApiError(403, "Worker or admin only")
+    conn = db()
+    rows = conn.execute("SELECT * FROM card_bases WHERE active=1").fetchall()
+    out = []
+    for r in rows:
+        sc = conn.execute("SELECT COUNT(*) FROM cards WHERE base_id=? AND sold=0", (r["id"],)).fetchone()[0]
+        out.append({"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": sc})
+    conn.close()
+    return out
+
+@app.get("/api/worker/orders")
+def worker_orders(user: dict = Depends(get_current_user)):
+    if user["rank"] not in ("admin", "worker"):
+        raise ApiError(403, "Worker or admin only")
+    conn = db()
+    rows = conn.execute("""SELECT o.*, u.email FROM orders o JOIN users u ON u.id=o.user_id
+                           ORDER BY o.id DESC LIMIT 200""").fetchall()
+    conn.close()
+    return [{"id": r["id"], "email": r["email"], "variantId": r["variant_id"], "quantity": r["quantity"],
+             "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
 
 # ================= STATIC (mount LAST) =================
 app.mount("/uploads", StaticFiles(directory=UPLOADS), name="uploads")
