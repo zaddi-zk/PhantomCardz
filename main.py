@@ -336,7 +336,7 @@ app = FastAPI(title=f"{SITE} API", version="1.0.0", lifespan=lifespan)
 
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=DOMAINS + ["testserver"])
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=DOMAINS + ["testserver", "*.onrender.com"])
 app.add_middleware(CORSMiddleware,
     allow_origins=[f"https://{d}" for d in DOMAINS] + [f"http://{d}" for d in DOMAINS] + ["http://localhost:8000"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -522,6 +522,13 @@ def my_rank(user: dict = Depends(get_current_user)):
     return {"rank": r, "name": n, "discount": d, "discountPct": d}
 
 # ================= PUBLIC =================
+@app.get("/")
+def read_root(request: Request):
+    # Uptime monitors get JSON; real browsers keep getting the SPA.
+    if "text/html" in request.headers.get("accept", ""):
+        return FileResponse(os.path.join(FRONTEND, "index.html"))
+    return {"status": "ok", "message": "PhantomCardz API is running"}
+
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "api"}
