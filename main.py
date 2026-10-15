@@ -1,0 +1,1456 @@
+#!/usr/bin/env python3
+"""PhantomCardz — cards & accounts marketplace backend (FastAPI + SQLite)."""
+import os, sqlite3, secrets, random, time, hashlib, string, json
+from contextlib import asynccontextmanager
+from typing import Optional, List, Dict, Any
+
+from fastapi import FastAPI, Depends, Request, UploadFile, File
+from fastapi.responses import JSONResponse, Response, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+DB_PATH  = os.path.join(APP_ROOT, "market.db")
+FRONTEND = os.path.join(APP_ROOT, "frontend")
+UPLOADS  = os.path.join(APP_ROOT, "uploads")
+os.makedirs(UPLOADS, exist_ok=True)
+
+def _load_env():
+    p = os.path.join(APP_ROOT, ".env")
+    if os.path.exists(p):
+        for line in open(p):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, _, v = line.partition("=")
+                os.environ.setdefault(k.strip(), v.strip())
+_load_env()
+
+SITE         = os.getenv("SITE_NAME", "PhantomCardz")
+ADMIN_EMAIL  = os.getenv("ADMIN_EMAIL", "admin@phantomcardz.cc")
+ADMIN_PASS   = os.getenv("ADMIN_PASSWORD", "Boss123!")
+ADMIN_TG     = os.getenv("ADMIN_TELEGRAM", "@phantomadmin")
+CASHAPP      = os.getenv("CASHAPP_HANDLE", "$PhantomCardz")
+BTC_ADDR     = os.getenv("BTC_ADDRESS", "bc1qphantom0000000000000000000000000000dead")
+ETH_ADDR     = os.getenv("ETH_ADDRESS", "0xPhantom000000000000000000000000000dead")
+LTC_ADDR     = os.getenv("LTC_ADDRESS", "ltc1qphantom00000000000000000000dead")
+DOMAINS      = [d.strip() for d in os.getenv("ALLOWED_HOSTS", "phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1").split(",") if d.strip()]
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
+
+security = HTTPBearer(auto_error=False)
+
+class ApiError(Exception):
+    def __init__(self, status: int, message: str):
+        self.status = status
+        self.message = message
+
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def h(pw: str, salt: str) -> str:
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000)
+    return "pbkdf2$" + dk.hex()
+
+def verify_pw(pw: str, salt: str, stored: str) -> bool:
+    if stored.startswith("pbkdf2$"):
+        return secrets.compare_digest(h(pw, salt), stored)
+    return secrets.compare_digest(hashlib.sha256((salt + pw).encode()).hexdigest(), stored)
+
+def now() -> int:
+    return int(time.time())
+
+def ts(v) -> Dict[str, int]:
+    return {"_seconds": int(v or 0)}
+
+def rand_str(n: int = 8) -> str:
+    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+_rl: dict = {}
+def _rl_hit(key: str, limit: int, window: int) -> bool:
+    t = time.time()
+    hits = [x for x in _rl.get(key, []) if t - x < window]
+    hits.append(t)
+    _rl[key] = hits
+    return len(hits) > limit
+
+LOGS = os.path.join(APP_ROOT, "logs"); os.makedirs(LOGS, exist_ok=True)
+def audit(event: str, actor: str = "-", detail: str = ""):
+    with open(os.path.join(LOGS, "audit.log"), "a") as f:
+        f.write(f"{now()} | {event} | {actor} | {detail}\n")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    telegram TEXT,
+    balance REAL DEFAULT 0,
+    rank TEXT DEFAULT 'user',
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS tokens(
+    token TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS products(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, description TEXT, image TEXT,
+    active INTEGER DEFAULT 1, pinned INTEGER DEFAULT 0,
+    owner_id INTEGER DEFAULT 1,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS variants(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    productId INTEGER, name TEXT,
+    price REAL, comparePrice REAL,
+    minQuantity INTEGER DEFAULT 1,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS stock_items(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant_id INTEGER, content TEXT,
+    sold INTEGER DEFAULT 0, order_id INTEGER,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS orders(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, variant_id INTEGER, quantity INTEGER,
+    total REAL, status TEXT DEFAULT 'completed',
+    items TEXT, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS wallet_codes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE, value REAL, used INTEGER DEFAULT 0,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS deposits(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, method TEXT, amount REAL,
+    reference TEXT, status TEXT DEFAULT 'pending',
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS discount_codes(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT UNIQUE, percent INTEGER, active INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS card_bases(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT, price REAL, active INTEGER DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS cards(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    base_id INTEGER, number TEXT, exp_month INTEGER, exp_year INTEGER, cvv TEXT,
+    sold INTEGER DEFAULT 0, buyer_id INTEGER,
+    checked INTEGER DEFAULT 0, valid INTEGER
+);
+CREATE TABLE IF NOT EXISTS games_mines(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, mines INTEGER, amount REAL,
+    safe_picks INTEGER DEFAULT 0, mines_map TEXT,
+    opened TEXT, active INTEGER DEFAULT 1, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS game_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, game TEXT, amount REAL, payout REAL, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS settings(
+    key TEXT PRIMARY KEY, value TEXT
+);
+CREATE TABLE IF NOT EXISTS announcements(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT, link TEXT, active INTEGER DEFAULT 1,
+    bannerColor TEXT DEFAULT '#000000', created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS password_resets(
+    email TEXT, code TEXT, expires INTEGER, used INTEGER DEFAULT 0,
+    PRIMARY KEY(email, code)
+);
+CREATE TABLE IF NOT EXISTS vouches(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    giver_id INTEGER, token TEXT UNIQUE,
+    used_by INTEGER, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS tickets(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER, subject TEXT, body TEXT,
+    status TEXT DEFAULT 'open', created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS ticket_replies(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id INTEGER, admin_id INTEGER, body TEXT, created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS seller_apps(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER UNIQUE, telegram TEXT, motivation TEXT,
+    status TEXT DEFAULT 'pending', created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS telegram_claims(
+    user_id INTEGER PRIMARY KEY, last_claim INTEGER
+);
+"""
+
+def luhn_generate(length: int = 16) -> str:
+    digits = [random.randint(0, 9) for _ in range(length - 1)]
+    total = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 0:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    digits.append((10 - (total % 10)) % 10)
+    return "".join(map(str, digits))
+
+def init_db():
+    conn = db()
+    conn.executescript(SCHEMA)
+    conn.executescript("""
+    CREATE INDEX IF NOT EXISTS idx_tokens_user ON tokens(user_id);
+    CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
+    CREATE INDEX IF NOT EXISTS idx_stock_variant ON stock_items(variant_id, sold);
+    CREATE INDEX IF NOT EXISTS idx_cards_base ON cards(base_id, sold);
+    CREATE INDEX IF NOT EXISTS idx_cards_buyer ON cards(buyer_id);
+    CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id);
+    CREATE INDEX IF NOT EXISTS idx_gamehist_user ON game_history(user_id);
+    CREATE INDEX IF NOT EXISTS idx_products_active ON products(active, pinned);
+    """)
+    c = conn.cursor()
+    if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        c.execute("INSERT INTO users(email,password_hash,telegram,balance,rank,created_at) VALUES(?,?,?,?,?,?)",
+                  (ADMIN_EMAIL, h(ADMIN_PASS, ADMIN_EMAIL), ADMIN_TG, 1000.0, "admin", now()))
+    if c.execute("SELECT COUNT(*) FROM announcements").fetchone()[0] == 0:
+        c.execute("INSERT INTO announcements(content,link,active,bannerColor,created_at) VALUES(?,?,?,?,?)",
+                  (f"Welcome to {SITE} — deposits are open!", None, 1, "#000000", now()))
+    if c.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
+        seeds = [
+            ("Hotmail FA", "Login and loot for goodies, easiest way to make a band!", 1, "Hotmails FA (Random)", 35.0, 25),
+            ("Outlook FA", "Fresh farmed outlooks, ready for work.", 0, "Outlooks FA (Random)", 30.0, 40),
+            ("Combo Lists", "Fresh combo lists for cracking.", 0, "Combos (10k lines)", 10.0, 50),
+        ]
+        for name, desc, pinned, vname, price, n in seeds:
+            c.execute("INSERT INTO products(name,description,image,active,pinned,owner_id,created_at) VALUES(?,?,?,1,?,1,?)",
+                      (name, desc, "/api/images/1", pinned, now()))
+            pid = c.lastrowid
+            c.execute("INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,1,?)",
+                      (pid, vname, price, now()))
+            vid = c.lastrowid
+            for _ in range(n):
+                c.execute("INSERT INTO stock_items(variant_id,content,created_at) VALUES(?,?,?)",
+                          (vid, f"{rand_str(7)}@hotmail.com:{rand_str(10).capitalize()}1!", now()))
+    if c.execute("SELECT COUNT(*) FROM card_bases").fetchone()[0] == 0:
+        for name, price in [("US Classic", 5.0), ("Premium Mix", 12.0)]:
+            c.execute("INSERT INTO card_bases(name,price,active) VALUES(?,?,1)", (name, price))
+            bid = c.lastrowid
+            for _ in range(20):
+                c.execute("INSERT INTO cards(base_id,number,exp_month,exp_year,cvv) VALUES(?,?,?,?,?)",
+                          (bid, luhn_generate(16), random.randint(1, 12),
+                           random.randint(2027, 2030), f"{random.randint(100, 999)}"))
+    if c.execute("SELECT COUNT(*) FROM discount_codes").fetchone()[0] == 0:
+        for code, pct in [("PHANTOM10", 10), ("PHANTOM25", 25)]:
+            c.execute("INSERT INTO discount_codes(code,percent,active) VALUES(?,?,1)", (code, pct))
+    defaults = {
+        "manual_payments": json.dumps({"cashapp": CASHAPP,
+            "bitcoin": BTC_ADDR,
+            "ethereum": ETH_ADDR,
+            "litecoin": LTC_ADDR}),
+        "min_deposits": json.dumps({"cashapp": 5, "crypto": 10}),
+        "features": json.dumps({"checker": True, "reseller": True, "ranks": True, "logs": True, "cards": True, "plinko": False}),
+        "payment_methods": json.dumps({"wallet": True, "cashapp": True, "crypto": True, "stars": False,
+                                       "venmo": False, "zelle": False, "chime": True, "applepay": False}),
+    }
+    for k, v in defaults.items():
+        c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+    conn.commit()
+    conn.close()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+app = FastAPI(title=f"{SITE} API", version="1.0.0", lifespan=lifespan)
+
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=DOMAINS + ["testserver"])
+app.add_middleware(CORSMiddleware,
+    allow_origins=[f"https://{d}" for d in DOMAINS] + [f"http://{d}" for d in DOMAINS] + ["http://localhost:8000"],
+    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.exception_handler(ApiError)
+async def on_api_error(request, exc: ApiError):
+    return JSONResponse({"message": exc.message}, status_code=exc.status)
+
+@app.exception_handler(StarletteHTTPException)
+async def spa_or_json_404(request: Request, exc: StarletteHTTPException):
+    path = request.url.path
+    last = path.rsplit("/", 1)[-1]
+    if exc.status_code == 404 and not path.startswith("/api") and not path.startswith("/uploads") and "." not in last:
+        return FileResponse(os.path.join(FRONTEND, "index.html"))
+    msg = exc.detail if isinstance(exc.detail, str) else "Error"
+    return JSONResponse({"message": msg}, status_code=exc.status_code)
+
+def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
+    token = None
+    if credentials and credentials.credentials:
+        token = credentials.credentials
+    if not token:
+        token = request.cookies.get("session")
+    if not token:
+        raise ApiError(401, "No auth")
+    conn = db()
+    t = conn.execute("SELECT user_id FROM tokens WHERE token=?", (token,)).fetchone()
+    if not t:
+        conn.close()
+        raise ApiError(401, "Invalid token")
+    u = conn.execute("SELECT * FROM users WHERE id=?", (t["user_id"],)).fetchone()
+    conn.close()
+    if not u:
+        raise ApiError(401, "Invalid token")
+    return dict(u)
+
+def require_admin(user: dict):
+    if user.get("rank") != "admin":
+        raise ApiError(403, "Admin only")
+
+def create_token(conn, user_id: int) -> str:
+    token = secrets.token_hex(32)
+    conn.execute("INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)", (token, user_id, now()))
+    return token
+
+def user_out(u) -> dict:
+    return {"id": u["id"], "email": u["email"], "balance": u["balance"], "rank": u["rank"]}
+
+def get_setting(conn, key: str, fallback="{}"):
+    r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return r["value"] if r else fallback
+
+def set_setting(conn, key: str, value: str):
+    conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, value))
+
+# ================= AUTH =================
+class CredsIn(BaseModel):
+    email: str
+    password: str
+    rememberMe: Optional[bool] = None
+
+class RegisterIn(BaseModel):
+    email: str
+    password: str
+    telegram: Optional[str] = None
+
+@app.post("/api/login")
+def login(request: Request, data: CredsIn):
+    if _rl_hit(f"login:{request.client.host if request.client else 'x'}", 10, 60):
+        raise ApiError(429, "Too many attempts, wait a minute")
+    conn = db()
+    u = conn.execute("SELECT * FROM users WHERE email=?", (data.email,)).fetchone()
+    if not u or not verify_pw(data.password, data.email, u["password_hash"]):
+        conn.close()
+        raise ApiError(401, "Invalid email or password")
+    token = create_token(conn, u["id"])
+    conn.commit()
+    conn.close()
+    resp = JSONResponse({"token": token, "user": user_out(u)})
+    resp.set_cookie(key="session", value=token, httponly=True, secure=COOKIE_SECURE,
+                    samesite="lax", path="/", max_age=7 * 24 * 3600)
+    return resp
+
+@app.post("/api/register")
+def register(request: Request, data: RegisterIn):
+    if _rl_hit(f"reg:{request.client.host if request.client else 'x'}", 5, 3600):
+        raise ApiError(429, "Too many registrations, slow down")
+    conn = db()
+    try:
+        conn.execute("INSERT INTO users(email,password_hash,telegram,balance,rank,created_at) VALUES(?,?,?,?,?,?)",
+                     (data.email, h(data.password, data.email), data.telegram, 0.0, "user", now()))
+        u = conn.execute("SELECT * FROM users WHERE email=?", (data.email,)).fetchone()
+        token = create_token(conn, u["id"])
+        conn.commit()
+        audit("register", data.email)
+        conn.close()
+        resp = JSONResponse({"token": token, "user": user_out(u)})
+        resp.set_cookie(key="session", value=token, httponly=True, secure=COOKIE_SECURE,
+                        samesite="lax", path="/", max_age=7 * 24 * 3600)
+        return resp
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise ApiError(400, "Email already exists")
+
+@app.get("/api/user")
+def me(user: dict = Depends(get_current_user)):
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (user["id"],)).fetchone()[0]
+    spent = conn.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE user_id=? AND status='completed'",
+                         (user["id"],)).fetchone()[0]
+    conn.close()
+    return {"id": user["id"], "email": user["email"], "balance": user["balance"], "rank": user["rank"],
+            "telegram": user["telegram"], "orders": n, "totalSpent": round(spent, 2)}
+
+@app.post("/api/logout")
+def logout(user: dict = Depends(get_current_user)):
+    conn = db()
+    conn.execute("DELETE FROM tokens WHERE user_id=?", (user["id"],))
+    conn.commit()
+    conn.close()
+    resp = JSONResponse({"message": "Logged out", "ok": True})
+    resp.delete_cookie("session", path="/")
+    return resp
+
+class PasswordIn(BaseModel):
+    currentPassword: str
+    newPassword: str
+
+@app.post("/api/user/password")
+def change_password(data: PasswordIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    if not verify_pw(data.currentPassword, user["email"], user["password_hash"]):
+        conn.close()
+        raise ApiError(400, "Wrong password")
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?",
+                 (h(data.newPassword, user["email"]), user["id"]))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+class EmailIn(BaseModel):
+    password: str
+    newEmail: str
+
+@app.post("/api/user/email")
+def change_email(data: EmailIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    if not verify_pw(data.password, user["email"], user["password_hash"]):
+        conn.close()
+        raise ApiError(400, "Wrong password")
+    conn.execute("UPDATE users SET email=?, password_hash=? WHERE id=?",
+                 (data.newEmail, h(data.password, data.newEmail), user["id"]))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@app.get("/api/user/rank")
+def my_rank(user: dict = Depends(get_current_user)):
+    conn = db()
+    spent = conn.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE user_id=? AND status='completed'",
+                         (user["id"],)).fetchone()[0]
+    conn.close()
+    if spent >= 5000: r, n, d = "Diamond", "Diamond", 10
+    elif spent >= 1000: r, n, d = "Gold", "Gold", 5
+    elif spent >= 250: r, n, d = "Silver", "Silver", 2
+    else: r, n, d = "user", "Bronze", 0
+    return {"rank": r, "name": n, "discount": d, "discountPct": d}
+
+# ================= PUBLIC =================
+@app.get("/api/health")
+def health():
+    return {"ok": True, "service": "api"}
+
+@app.get("/api/announcements")
+def announcements():
+    conn = db()
+    rows = conn.execute("SELECT * FROM announcements WHERE active=1 ORDER BY id DESC").fetchall()
+    conn.close()
+    return [{"id": r["id"], "content": r["content"], "link": r["link"], "active": bool(r["active"]),
+             "createdAt": ts(r["created_at"]), "bannerColor": r["bannerColor"]} for r in rows]
+
+@app.get("/api/products")
+def products():
+    conn = db()
+    rows = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY pinned DESC, id DESC").fetchall()
+    out = []
+    for r in rows:
+        vs = conn.execute("SELECT * FROM variants WHERE productId=?", (r["id"],)).fetchall()
+        vv = []
+        for v in vs:
+            sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0",
+                              (v["id"],)).fetchone()[0]
+            vv.append({"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
+                      "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": sc})
+        out.append({"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
+                    "active": bool(r["active"]), "pinned": bool(r["pinned"]), "createdAt": ts(r["created_at"]),
+                    "variants": vv})
+    conn.close()
+    return out
+
+@app.get("/api/payment-methods")
+def payment_methods():
+    conn = db()
+    data = json.loads(get_setting(conn, "payment_methods"))
+    conn.close()
+    return data
+
+@app.get("/api/settings/features")
+def features():
+    conn = db()
+    data = json.loads(get_setting(conn, "features"))
+    conn.close()
+    return data
+
+@app.get("/api/site-settings/manual-payments")
+def manual_payments():
+    conn = db()
+    data = json.loads(get_setting(conn, "manual_payments"))
+    conn.close()
+    return data
+
+@app.get("/api/site-settings/min-deposits")
+def min_deposits():
+    conn = db()
+    data = json.loads(get_setting(conn, "min_deposits"))
+    conn.close()
+    return data
+
+@app.get("/api/images/{image_id}")
+def image(image_id: int):
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="200">'
+           '<rect width="200" height="200" fill="#0d0d14"/>'
+           f'<text x="100" y="105" fill="#00ff9d" font-size="40" text-anchor="middle" font-family="monospace">#{image_id}</text></svg>')
+    return Response(content=svg, media_type="image/svg+xml")
+
+@app.get("/api/stock")
+def stock_totals():
+    conn = db()
+    p = conn.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
+    s = conn.execute("SELECT COUNT(*) FROM stock_items WHERE sold=0").fetchone()[0]
+    conn.close()
+    return {"products": p, "itemsInStock": s}
+
+# ================= ORDERS (PHASE A) =================
+class OrderIn(BaseModel):
+    variantId: int
+    quantity: int = 1
+    code: Optional[str] = None
+
+@app.post("/api/orders")
+def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
+    if data.quantity < 1:
+        raise ApiError(400, "Invalid quantity")
+    conn = db()
+    v = conn.execute("SELECT * FROM variants WHERE id=?", (data.variantId,)).fetchone()
+    if not v:
+        conn.close()
+        raise ApiError(404, "Not found")
+    stock = conn.execute("SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?",
+                         (data.variantId, data.quantity)).fetchall()
+    if len(stock) < data.quantity:
+        conn.close()
+        raise ApiError(400, "Insufficient stock")
+    total = v["price"] * data.quantity
+    if data.code:
+        d = conn.execute("SELECT * FROM discount_codes WHERE code=? AND active=1", (data.code,)).fetchone()
+        if d:
+            total = total * (1 - d["percent"] / 100.0)
+    total = round(total, 2)
+    cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                       (total, user["id"], total))
+    if cur.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        raise ApiError(400, "Insufficient balance")
+    items = [s["content"] for s in stock]
+    oid = conn.execute("INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
+                       (user["id"], data.variantId, data.quantity, total, "completed", json.dumps(items), now())).lastrowid
+    for s in stock:
+        conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=?", (oid, s["id"]))
+    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    return {"id": oid, "items": items, "total": total, "newBalance": round(u["balance"], 2)}
+
+@app.get("/api/orders")
+def my_orders(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "variantId": r["variant_id"], "quantity": r["quantity"], "total": r["total"],
+             "status": r["status"], "createdAt": ts(r["created_at"]),
+             "items": json.loads(r["items"] or "[]")} for r in rows]
+
+@app.get("/api/orders/export")
+def export_orders(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT items FROM orders WHERE user_id=? AND status='completed' ORDER BY id DESC",
+                        (user["id"],)).fetchall()
+    conn.close()
+    lines = []
+    for r in rows:
+        lines.extend(json.loads(r["items"] or "[]"))
+    return {"content": "\n".join(lines)}
+
+@app.get("/api/orders/{order_id}")
+def one_order(order_id: int, user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, user["id"])).fetchone()
+    conn.close()
+    if not r:
+        raise ApiError(404, "Not found")
+    return {"id": r["id"], "variantId": r["variant_id"], "quantity": r["quantity"], "total": r["total"],
+            "status": r["status"], "createdAt": ts(r["created_at"]),
+            "items": json.loads(r["items"] or "[]")}
+
+class DiscountIn(BaseModel):
+    code: str
+
+@app.post("/api/discount/validate")
+def validate_discount(data: DiscountIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    d = conn.execute("SELECT * FROM discount_codes WHERE code=? AND active=1", (data.code,)).fetchone()
+    conn.close()
+    if d:
+        return {"valid": True, "percent": d["percent"]}
+    return {"valid": False}
+
+# ================= WALLET =================
+class RedeemIn(BaseModel):
+    code: str
+
+@app.post("/api/wallet/redeem")
+def redeem(data: RedeemIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT * FROM wallet_codes WHERE code=? AND used=0", (data.code.upper(),)).fetchone()
+    if not r:
+        conn.close()
+        raise ApiError(400, "Invalid code")
+    conn.execute("UPDATE wallet_codes SET used=1 WHERE id=?", (r["id"],))
+    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (r["value"], user["id"]))
+    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    return {"newBalance": round(u["balance"], 2), "redeemed": r["value"]}
+
+@app.get("/api/wallet/transactions")
+def wallet_txs(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 50", (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "variant": r["variant_id"], "quantity": r["quantity"], "amount": r["total"],
+             "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+
+# ================= DEPOSITS (PHASE B) =================
+class CashappIn(BaseModel):
+    amount: float
+    cashtag: Optional[str] = None
+
+@app.post("/api/orders/cashapp")
+def deposit_cashapp(data: CashappIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    mins = json.loads(get_setting(conn, "min_deposits"))
+    if data.amount < mins.get("cashapp", 5):
+        conn.close()
+        raise ApiError(400, f"Minimum deposit is ${mins.get('cashapp', 5)}")
+    mp = json.loads(get_setting(conn, "manual_payments"))
+    ref = secrets.token_hex(4).upper()
+    conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
+                 (user["id"], "cashapp", data.amount, ref, "pending", now()))
+    conn.commit()
+    conn.close()
+    return {"status": "pending", "reference": ref,
+            "instructions": f"Send ${data.amount} via CashApp to {mp.get('cashapp','$PhantomCardz')} then message {ADMIN_TG} on Telegram with code {ref} and your email {user['email']}"}
+
+class CryptoIn(BaseModel):
+    amount: float
+    currency: str = "BTC"
+
+@app.post("/api/payments/crypto/create")
+def deposit_crypto(data: CryptoIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    mins = json.loads(get_setting(conn, "min_deposits"))
+    if data.amount < mins.get("crypto", 10):
+        conn.close()
+        raise ApiError(400, f"Minimum deposit is ${mins.get('crypto', 10)}")
+    mp = json.loads(get_setting(conn, "manual_payments"))
+    addr = mp.get("bitcoin", "bc1qphantomdead")
+    if data.currency == "ETH": addr = mp.get("ethereum", "0xph")
+    elif data.currency == "LTC": addr = mp.get("litecoin", "ltc1qph")
+    ref = secrets.token_hex(4).upper()
+    conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
+                 (user["id"], f"crypto:{data.currency}", data.amount, ref, "pending", now()))
+    conn.commit()
+    conn.close()
+    return {"address": addr, "amount": data.amount, "currency": data.currency, "reference": ref,
+            "status": "pending", "expiresAt": ts(now() + 3600)}
+
+@app.get("/api/payments/crypto/currencies")
+def crypto_currencies():
+    return [{"symbol": "BTC", "min": 10}, {"symbol": "ETH", "min": 10},
+            {"symbol": "LTC", "min": 10}, {"symbol": "USDT", "min": 10}]
+
+@app.get("/api/payments/crypto/status")
+def crypto_status(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "method": r["method"], "amount": r["amount"], "reference": r["reference"],
+             "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+
+@app.get("/api/payments/crypto/{pid}/status")
+def crypto_payment_status(pid: int, user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT * FROM deposits WHERE id=? AND user_id=?", (pid, user["id"])).fetchone()
+    conn.close()
+    if not r:
+        raise ApiError(404, "Not found")
+    return {"status": r["status"], "reference": r["reference"], "amount": r["amount"],
+            "createdAt": ts(r["created_at"])}
+
+@app.get("/api/deposits")
+def my_deposits(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "method": r["method"], "amount": r["amount"], "reference": r["reference"],
+             "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+
+# ================= CARDS + CHECKER (PHASE C) =================
+@app.get("/api/card-bases")
+def card_bases():
+    conn = db()
+    rows = conn.execute("SELECT * FROM card_bases WHERE active=1").fetchall()
+    out = []
+    for r in rows:
+        sc = conn.execute("SELECT COUNT(*) FROM cards WHERE base_id=? AND sold=0", (r["id"],)).fetchone()[0]
+        out.append({"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": sc})
+    conn.close()
+    return out
+
+class BuyCardIn(BaseModel):
+    baseId: int
+
+@app.post("/api/cards")
+def buy_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    b = conn.execute("SELECT * FROM card_bases WHERE id=?", (data.baseId,)).fetchone()
+    if not b:
+        conn.close()
+        raise ApiError(404, "Not found")
+    c = conn.execute("SELECT * FROM cards WHERE base_id=? AND sold=0 ORDER BY RANDOM() LIMIT 1",
+                     (data.baseId,)).fetchone()
+    if not c:
+        conn.close()
+        raise ApiError(400, "Out of stock")
+    total = b["price"]
+    cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?", (total, user["id"], total))
+    if cur.rowcount != 1:
+        conn.rollback()
+        conn.close()
+        raise ApiError(400, "Insufficient balance")
+    conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=?", (user["id"], c["id"]))
+    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    return {"id": c["id"], "number": c["number"], "expMonth": c["exp_month"],
+            "expYear": c["exp_year"], "cvv": c["cvv"], "newBalance": round(u["balance"], 2)}
+
+@app.get("/api/user/cards")
+def my_cards(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("""SELECT ca.*, cb.name AS base_name FROM cards ca
+                           JOIN card_bases cb ON cb.id=ca.base_id
+                           WHERE ca.buyer_id=? ORDER BY ca.id DESC""", (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "base": r["base_name"], "number": r["number"], "expMonth": r["exp_month"],
+             "expYear": r["exp_year"], "cvv": r["cvv"],
+             "checked": bool(r["checked"]), "valid": r["valid"]} for r in rows]
+
+class CheckIn(BaseModel):
+    cardId: int
+
+@app.post("/api/checker/check")
+def check_card(data: CheckIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    c = conn.execute("SELECT ca.* FROM cards ca WHERE ca.id=? AND ca.buyer_id=?", (data.cardId, user["id"])).fetchone()
+    if not c:
+        conn.close()
+        raise ApiError(404, "Not found")
+    valid = random.random() < 0.7
+    conn.execute("UPDATE cards SET checked=1, valid=? WHERE id=?", (1 if valid else 0, data.cardId))
+    conn.commit()
+    conn.close()
+    return {"cardId": data.cardId, "valid": valid, "message": "Approved" if valid else "Declined"}
+
+@app.get("/api/checker/config")
+def checker_config(user: dict = Depends(get_current_user)):
+    return {"enabled": True, "dailyLimit": 50}
+
+# ================= GAMES (PHASE D) =================
+class DiceIn(BaseModel):
+    amount: float
+    guessOver: int
+
+@app.post("/api/games/dice")
+def game_dice(data: DiceIn, user: dict = Depends(get_current_user)):
+    if not (2 <= data.guessOver <= 98):
+        raise ApiError(400, "guessOver must be 2-98")
+    conn = db()
+    cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                       (data.amount, user["id"], data.amount))
+    if cur.rowcount != 1:
+        conn.rollback(); conn.close()
+        raise ApiError(400, "Insufficient balance")
+    roll = round(random.uniform(0, 100), 2)
+    mult = 99.0 / (100 - data.guessOver)
+    win = roll > data.guessOver
+    payout = round(data.amount * mult, 2) if win else 0.0
+    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (payout, user["id"]))
+    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+    conn.execute("INSERT INTO game_history(user_id,game,amount,payout,created_at) VALUES(?,?,?,?,?)",
+                 (user["id"], "dice", data.amount, payout, now()))
+    conn.commit(); conn.close()
+    return {"result": "win" if win else "lose", "roll": roll, "multiplier": round(mult, 4),
+            "payout": payout, "newBalance": round(u["balance"], 2)}
+
+class SpinIn(BaseModel):
+    amount: float
+
+@app.post("/api/games/spin")
+def game_spin(data: SpinIn, user: dict = Depends(get_current_user)):
+    symbols = ["Cherry", "Lemon", "Bell", "Seven", "Diamond"]
+    weights = [40, 30, 15, 10, 5]
+    pay = {"Cherry": 2, "Lemon": 3, "Bell": 5, "Seven": 10, "Diamond": 25}
+    reels = random.choices(symbols, weights=weights, k=3)
+    conn = db()
+    cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                       (data.amount, user["id"], data.amount))
+    if cur.rowcount != 1:
+        conn.rollback(); conn.close()
+        raise ApiError(400, "Insufficient balance")
+    payout = 0.0
+    if reels[0] == reels[1] == reels[2]:
+        payout = round(data.amount * pay[reels[0]] * 0.95, 2)
+    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (payout, user["id"]))
+    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+    conn.execute("INSERT INTO game_history(user_id,game,amount,payout,created_at) VALUES(?,?,?,?,?)",
+                 (user["id"], "spin", data.amount, payout, now()))
+    conn.commit(); conn.close()
+    return {"result": "win" if payout > 0 else "lose", "reels": reels,
+            "payout": payout, "newBalance": round(u["balance"], 2)}
+
+class MinesIn(BaseModel):
+    amount: float = 0
+    mines: int = 3
+    action: str = "start"
+    tile: Optional[int] = None
+    gameId: Optional[int] = None
+
+@app.post("/api/games/mines")
+def game_mines(data: MinesIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    if data.action == "start":
+        if not (1 <= data.mines <= 24):
+            conn.close()
+            raise ApiError(400, "mines must be 1-24")
+        live = conn.execute("SELECT * FROM games_mines WHERE user_id=? AND active=1", (user["id"],)).fetchone()
+        if live:
+            conn.close()
+            raise ApiError(400, "Finish current game first")
+        cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                           (data.amount, user["id"], data.amount))
+        if cur.rowcount != 1:
+            conn.rollback(); conn.close()
+            raise ApiError(400, "Insufficient balance")
+        mm = random.sample(range(25), data.mines)
+        gid = conn.execute("""INSERT INTO games_mines(user_id,mines,amount,safe_picks,mines_map,opened,active,created_at)
+                        VALUES(?,?,?,?,?,?,1,?)""",
+                      (user["id"], data.mines, data.amount, 0, json.dumps(mm), json.dumps([]), now())).lastrowid
+        u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+        conn.commit(); conn.close()
+        return {"gameId": gid, "status": "started", "mines": data.mines,
+                "newBalance": round(u["balance"], 2)}
+    g = conn.execute("SELECT * FROM games_mines WHERE id=? AND user_id=? AND active=1",
+                     (data.gameId, user["id"])).fetchone()
+    if not g:
+        conn.close()
+        raise ApiError(404, "Not found")
+    mines_map = json.loads(g["mines_map"])
+    opened = json.loads(g["opened"])
+    if data.action == "pick":
+        if data.tile is None or data.tile < 0 or data.tile > 24:
+            conn.close()
+            raise ApiError(400, "Bad tile")
+        if data.tile in opened:
+            conn.close()
+            raise ApiError(400, "Tile already opened")
+        opened.append(data.tile)
+        if data.tile in mines_map:
+            conn.execute("UPDATE games_mines SET opened=?, active=0 WHERE id=?", (json.dumps(opened), g["id"]))
+            conn.execute("INSERT INTO game_history(user_id,game,amount,payout,created_at) VALUES(?,?,?,?,?)",
+                         (user["id"], "mines", g["amount"], 0.0, now()))
+            u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+            conn.commit(); conn.close()
+            return {"hit": True, "done": True, "tile": data.tile, "payout": 0.0,
+                    "newBalance": round(u["balance"], 2)}
+        safe = g["safe_picks"] + 1
+        conn.execute("UPDATE games_mines SET safe_picks=?, opened=? WHERE id=?",
+                     (safe, json.dumps(opened), g["id"]))
+        mult = round(0.97 * ((25.0 / (25 - g["mines"])) ** safe), 4)
+        conn.commit(); conn.close()
+        return {"hit": False, "done": False, "tile": data.tile, "safePicks": safe,
+                "multiplier": mult, "cashoutValue": round(g["amount"] * mult, 2)}
+    if data.action == "cashout":
+        safe = g["safe_picks"]
+        if safe < 1:
+            conn.close()
+            raise ApiError(400, "Pick at least one safe tile first")
+        mult = 0.97 * ((25.0 / (25 - g["mines"])) ** safe)
+        payout = round(g["amount"] * mult, 2)
+        conn.execute("UPDATE games_mines SET active=0 WHERE id=?", (g["id"],))
+        conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (payout, user["id"]))
+        conn.execute("INSERT INTO game_history(user_id,game,amount,payout,created_at) VALUES(?,?,?,?,?)",
+                     (user["id"], "mines", g["amount"], payout, now()))
+        u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+        conn.commit(); conn.close()
+        return {"result": "win", "multiplier": round(mult, 4), "payout": payout,
+                "newBalance": round(u["balance"], 2)}
+    conn.close()
+    raise ApiError(400, "Bad action")
+
+class PlinkoIn(BaseModel):
+    amount: float
+    risk: str = "low"
+
+@app.post("/api/games/plinko")
+def game_plinko(data: PlinkoIn, user: dict = Depends(get_current_user)):
+    tables = {
+        "low":  [16, 9, 2, 1.4, 1.4, 1.2, 1.1, 1.0, 0.5, 1.0, 1.1, 1.2, 1.4, 1.4, 2, 9, 16],
+        "high": [1000, 130, 26, 9, 4, 2, 0.2, 0.2, 0.2, 0.2, 0.2, 2, 4, 9, 26, 130, 1000],
+    }
+    tbl = tables.get(data.risk, tables["low"])
+    conn = db()
+    cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                       (data.amount, user["id"], data.amount))
+    if cur.rowcount != 1:
+        conn.rollback(); conn.close()
+        raise ApiError(400, "Insufficient balance")
+    pos = sum(1 for _ in range(16) if random.random() < 0.5)
+    payout = round(data.amount * tbl[pos], 2)
+    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (payout, user["id"]))
+    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+    conn.execute("INSERT INTO game_history(user_id,game,amount,payout,created_at) VALUES(?,?,?,?,?)",
+                 (user["id"], "plinko", data.amount, payout, now()))
+    conn.commit(); conn.close()
+    return {"bucket": pos, "multiplier": tbl[pos], "payout": payout,
+            "newBalance": round(u["balance"], 2)}
+
+@app.get("/api/games/history")
+def game_history_list(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT * FROM game_history WHERE user_id=? ORDER BY id DESC LIMIT 50",
+                        (user["id"],)).fetchall()
+    conn.close()
+    return [{"game": r["game"], "amount": r["amount"], "payout": r["payout"],
+             "createdAt": ts(r["created_at"])} for r in rows]
+
+# ================= ADMIN (PHASE E) =================
+@app.get("/api/admin/dashboard")
+def admin_dashboard(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    deps = conn.execute("SELECT COUNT(*) FROM deposits").fetchone()[0]
+    pend = conn.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
+    rev = conn.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE status='completed'").fetchone()[0]
+    cards_sold = conn.execute("SELECT COUNT(*) FROM cards WHERE sold=1").fetchone()[0]
+    bal = conn.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
+    grev = conn.execute("SELECT COALESCE(SUM(amount-payout),0) FROM game_history").fetchone()[0]
+    conn.close()
+    return {"users": users, "orders": orders, "deposits": deps, "pendingDeposits": pend,
+            "revenue": round(rev, 2), "cardsSold": cards_sold, "balance": round(bal, 2),
+            "gamesRevenue": round(grev, 2)}
+
+@app.get("/api/admin/users")
+def admin_users(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("SELECT * FROM users ORDER BY id").fetchall()
+    out = []
+    for r in rows:
+        n = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (r["id"],)).fetchone()[0]
+        out.append({"id": r["id"], "email": r["email"], "telegram": r["telegram"], "balance": r["balance"],
+                    "rank": r["rank"], "orders": n, "createdAt": ts(r["created_at"])})
+    conn.close()
+    return out
+
+@app.patch("/api/admin/users/{uid}")
+def admin_patch_user(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if "balance" in payload:
+        conn.execute("UPDATE users SET balance=? WHERE id=?", (payload["balance"], uid))
+    if "rank" in payload:
+        conn.execute("UPDATE users SET rank=? WHERE id=?", (payload["rank"], uid))
+    if "telegram" in payload:
+        conn.execute("UPDATE users SET telegram=? WHERE id=?", (payload["telegram"], uid))
+    r = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    conn.commit(); audit("user_patch", user["email"], f"target={uid} fields={sorted(payload.keys())}"); conn.close()
+    if not r:
+        raise ApiError(404, "Not found")
+    return {"id": r["id"], "email": r["email"], "balance": r["balance"], "rank": r["rank"], "telegram": r["telegram"]}
+
+@app.delete("/api/admin/users/{uid}")
+def admin_del_user(uid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("DELETE FROM users WHERE id=?", (uid,))
+    conn.execute("DELETE FROM tokens WHERE user_id=?", (uid,))
+    conn.commit(); audit("user_delete", user["email"], f"target={uid}"); conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/products")
+def admin_products(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
+    out = []
+    for r in rows:
+        vs = conn.execute("SELECT * FROM variants WHERE productId=?", (r["id"],)).fetchall()
+        vv = []
+        for v in vs:
+            sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0",
+                              (v["id"],)).fetchone()[0]
+            vv.append({"id": v["id"], "name": v["name"], "price": v["price"], "stockCount": sc})
+        out.append({"id": r["id"], "name": r["name"], "description": r["description"],
+                    "image": r["image"], "active": bool(r["active"]), "pinned": bool(r["pinned"]),
+                    "variants": vv})
+    conn.close()
+    return out
+
+class ProductIn(BaseModel):
+    name: str
+    description: str = ""
+    image: str = "/api/images/1"
+    pinned: bool = False
+
+@app.post("/api/admin/products")
+def admin_add_product(data: ProductIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    pid = conn.execute("INSERT INTO products(name,description,image,active,pinned,owner_id,created_at) VALUES(?,?,?,1,?,?,?)",
+                 (data.name, data.description, data.image, data.pinned, user["id"], now())).lastrowid
+    conn.commit(); conn.close()
+    return {"id": pid, "ok": True}
+
+@app.patch("/api/admin/products/{pid}")
+def admin_patch_product(pid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if "name" in payload:
+        conn.execute("UPDATE products SET name=? WHERE id=?", (payload["name"], pid))
+    if "description" in payload:
+        conn.execute("UPDATE products SET description=? WHERE id=?", (payload["description"], pid))
+    if "active" in payload:
+        conn.execute("UPDATE products SET active=? WHERE id=?", (1 if payload["active"] else 0, pid))
+    if "pinned" in payload:
+        conn.execute("UPDATE products SET pinned=? WHERE id=?", (1 if payload["pinned"] else 0, pid))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.delete("/api/admin/products/{pid}")
+def admin_del_product(pid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("DELETE FROM products WHERE id=?", (pid,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+class VariantIn(BaseModel):
+    name: str
+    price: float
+
+@app.post("/api/admin/products/{pid}/variants")
+def admin_add_variant(pid: int, data: VariantIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    vid = conn.execute("INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,1,?)",
+                 (pid, data.name, data.price, now())).lastrowid
+    conn.commit(); conn.close()
+    return {"id": vid, "ok": True}
+
+class BulkStockIn(BaseModel):
+    variantId: int
+    contents: str
+
+@app.post("/api/admin/stock/bulk")
+def admin_bulk_stock(data: BulkStockIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    lines = [l.strip() for l in data.contents.splitlines() if l.strip()]
+    conn = db()
+    for l in lines:
+        conn.execute("INSERT INTO stock_items(variant_id,content,created_at) VALUES(?,?,?)",
+                     (data.variantId, l, now()))
+    conn.commit(); conn.close()
+    return {"ok": True, "added": len(lines)}
+
+@app.patch("/api/admin/stock/{variant_id}")
+def admin_set_stock(variant_id: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    target = int(payload.get("stockCount", 0))
+    conn = db()
+    cur_unsold = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0",
+                              (variant_id,)).fetchone()[0]
+    if target > cur_unsold:
+        for _ in range(target - cur_unsold):
+            conn.execute("INSERT INTO stock_items(variant_id,content,created_at) VALUES(?,?,?)",
+                         (variant_id, f"{rand_str(7)}:{rand_str(10)}", now()))
+    else:
+        conn.execute("""DELETE FROM stock_items WHERE id IN
+                        (SELECT id FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?)""",
+                      (variant_id, cur_unsold - target))
+    conn.commit(); conn.close()
+    return {"ok": True, "stockCount": target}
+
+@app.get("/api/admin/deposits")
+def admin_deposits(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("""SELECT d.*, u.email FROM deposits d JOIN users u ON u.id=d.user_id
+                           ORDER BY d.id DESC""").fetchall()
+    conn.close()
+    return [{"id": r["id"], "email": r["email"], "method": r["method"], "amount": r["amount"],
+             "reference": r["reference"], "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+
+@app.post("/api/admin/deposits/{did}/approve")
+def approve_deposit(did: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    d = conn.execute("SELECT * FROM deposits WHERE id=?", (did,)).fetchone()
+    if not d or d["status"] != "pending":
+        conn.close()
+        raise ApiError(400, "Not a pending deposit")
+    conn.execute("UPDATE deposits SET status='approved' WHERE id=?", (did,))
+    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
+    conn.commit(); audit("deposit_approve", user["email"], f"id={did} amount={d['amount']}"); conn.close()
+    return {"ok": True}
+
+@app.post("/api/admin/deposits/{did}/reject")
+def reject_deposit(did: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("UPDATE deposits SET status='rejected' WHERE id=?", (did,))
+    conn.commit(); audit("deposit_reject", user["email"], f"id={did}"); conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/discount-codes")
+def admin_discounts(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("SELECT * FROM discount_codes ORDER BY id").fetchall()
+    conn.close()
+    return [{"id": r["id"], "code": r["code"], "percent": r["percent"], "active": bool(r["active"])} for r in rows]
+
+class DiscountCodeIn(BaseModel):
+    code: str
+    percent: int
+
+@app.post("/api/admin/discount-codes")
+def admin_add_discount(data: DiscountCodeIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO discount_codes(code,percent,active) VALUES(?,?,1)",
+                 (data.code.upper(), data.percent))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.delete("/api/admin/discount-codes/{did}")
+def admin_del_discount(did: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("DELETE FROM discount_codes WHERE id=?", (did,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/announcements")
+def admin_announcements(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("SELECT * FROM announcements ORDER BY id DESC").fetchall()
+    conn.close()
+    return [{"id": r["id"], "content": r["content"], "link": r["link"], "active": bool(r["active"]),
+             "bannerColor": r["bannerColor"], "createdAt": ts(r["created_at"])} for r in rows]
+
+class AnnounceIn(BaseModel):
+    content: str
+    link: Optional[str] = None
+    bannerColor: str = "#000000"
+
+@app.post("/api/admin/announcements")
+def admin_add_announcement(data: AnnounceIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("INSERT INTO announcements(content,link,active,bannerColor,created_at) VALUES(?,?,1,?,?)",
+                 (data.content, data.link, data.bannerColor, now()))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.delete("/api/admin/announcements/{aid}")
+def admin_del_announcement(aid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("DELETE FROM announcements WHERE id=?", (aid,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/payment-methods")
+def admin_get_pm(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    data = json.loads(get_setting(conn, "payment_methods"))
+    conn.close()
+    return data
+
+@app.post("/api/admin/payment-methods")
+def admin_set_pm(payload: Dict[str, bool], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    set_setting(conn, "payment_methods", json.dumps(payload))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.post("/api/admin/settings/features")
+def admin_set_features(payload: Dict[str, bool], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    set_setting(conn, "features", json.dumps(payload))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.post("/api/admin/site-settings")
+def admin_site_settings(payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if "manual_payments" in payload:
+        set_setting(conn, "manual_payments", json.dumps(payload["manual_payments"]))
+    if "min_deposits" in payload:
+        set_setting(conn, "min_deposits", json.dumps(payload["min_deposits"]))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/integrations/status")
+def admin_integrations(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    return {"telegram": True, "bitcoin": True, "cashapp": True, "authorizeNet": False}
+
+class ConfirmIn(BaseModel):
+    confirm: str
+
+@app.post("/api/admin/clear-all-data")
+def clear_all(data: ConfirmIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    if data.confirm != "YES":
+        raise ApiError(400, "Send confirm=YES")
+    conn = db()
+    for t in ["orders", "stock_items", "cards", "deposits", "game_history", "games_mines",
+              "tokens", "password_resets"]:
+        conn.execute(f"DELETE FROM {t}")
+    conn.commit(); audit("clear_all", user["email"]); conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/codes")
+def admin_codes(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("SELECT * FROM wallet_codes ORDER BY id DESC").fetchall()
+    conn.close()
+    return [{"id": r["id"], "code": r["code"], "value": r["value"], "used": bool(r["used"])} for r in rows]
+
+class CodeIn(BaseModel):
+    code: str
+    value: float
+
+@app.post("/api/admin/codes")
+def admin_add_code(data: CodeIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("INSERT OR IGNORE INTO wallet_codes(code,value,used,created_at) VALUES(?,?,0,?)",
+                 (data.code.upper(), data.value, now()))
+    conn.commit(); audit("code_add", user["email"], f"{data.code}=${data.value}"); conn.close()
+    return {"ok": True}
+
+@app.delete("/api/admin/codes/{cid}")
+def admin_del_code(cid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("DELETE FROM wallet_codes WHERE id=?", (cid,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+# ================= SELLER + VOUCHES (PHASE F) =================
+class SellerApplyIn(BaseModel):
+    telegram: str
+    motivation: Optional[str] = None
+
+@app.post("/api/seller/apply")
+def seller_apply(data: SellerApplyIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    conn.execute("""INSERT INTO seller_apps(user_id,telegram,motivation,status,created_at)
+                    VALUES(?,?,?,?,?)
+                    ON CONFLICT(user_id) DO UPDATE SET telegram=excluded.telegram,
+                    motivation=excluded.motivation, status='pending'""",
+                 (user["id"], data.telegram, data.motivation, "pending", now()))
+    conn.commit(); conn.close()
+    return {"status": "pending"}
+
+@app.get("/api/seller/me")
+def seller_me(user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT * FROM seller_apps WHERE user_id=?", (user["id"],)).fetchone()
+    n = conn.execute("SELECT COUNT(*) FROM products WHERE owner_id=?", (user["id"],)).fetchone()[0]
+    conn.close()
+    if not r:
+        return {"status": "none", "products": n}
+    return {"status": r["status"], "products": n}
+
+@app.post("/api/vouches/create-token")
+def vouch_token(user: dict = Depends(get_current_user)):
+    token = "VOUCH-" + secrets.token_hex(4).upper()
+    conn = db()
+    conn.execute("INSERT INTO vouches(giver_id,token,created_at) VALUES(?,?,?)", (user["id"], token, now()))
+    conn.commit(); conn.close()
+    return {"token": token}
+
+@app.get("/api/vouches")
+def my_vouches(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT * FROM vouches WHERE giver_id=?", (user["id"],)).fetchall()
+    conn.close()
+    return [{"token": r["token"], "usedBy": r["used_by"], "createdAt": ts(r["created_at"])} for r in rows]
+
+# ================= SUPPORT + MISC (PHASE G) =================
+class TicketIn(BaseModel):
+    subject: str
+    body: str
+
+@app.post("/api/support")
+def create_ticket(data: TicketIn, user: dict = Depends(get_current_user)):
+    conn = db()
+    tid = conn.execute("INSERT INTO tickets(user_id,subject,body,status,created_at) VALUES(?,?,?,'open',?)",
+                 (user["id"], data.subject, data.body, now())).lastrowid
+    conn.commit(); conn.close()
+    return {"id": tid, "status": "open"}
+
+@app.get("/api/support")
+def my_tickets(user: dict = Depends(get_current_user)):
+    conn = db()
+    rows = conn.execute("SELECT * FROM tickets WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+    out = []
+    for r in rows:
+        reps = conn.execute("SELECT * FROM ticket_replies WHERE ticket_id=? ORDER BY id", (r["id"],)).fetchall()
+        out.append({"id": r["id"], "subject": r["subject"], "body": r["body"], "status": r["status"],
+                    "createdAt": ts(r["created_at"]),
+                    "replies": [{"body": x["body"], "createdAt": ts(x["created_at"])} for x in reps]})
+    conn.close()
+    return out
+
+@app.get("/api/admin/support")
+def admin_tickets(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute("""SELECT t.*, u.email FROM tickets t JOIN users u ON u.id=t.user_id
+                           ORDER BY t.id DESC""").fetchall()
+    conn.close()
+    return [{"id": r["id"], "email": r["email"], "subject": r["subject"], "body": r["body"],
+             "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+
+class ReplyIn(BaseModel):
+    body: str
+
+@app.post("/api/admin/support/{tid}/reply")
+def admin_reply(tid: int, data: ReplyIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("INSERT INTO ticket_replies(ticket_id,admin_id,body,created_at) VALUES(?,?,?,?)",
+                 (tid, user["id"], data.body, now()))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.post("/api/admin/support/{tid}/close")
+def admin_close_ticket(tid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("UPDATE tickets SET status='closed' WHERE id=?", (tid,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+class ForgotIn(BaseModel):
+    email: str
+
+@app.post("/api/password/forgot")
+def password_forgot(data: ForgotIn):
+    conn = db()
+    u = conn.execute("SELECT * FROM users WHERE email=?", (data.email,)).fetchone()
+    if u:
+        code = str(random.randint(100000, 999999))
+        conn.execute("INSERT OR REPLACE INTO password_resets(email,code,expires,used) VALUES(?,?,?,0)",
+                     (data.email, code, now() + 900))
+        print(f"[{SITE}] reset code for {data.email}: {code}")
+        conn.commit()
+    conn.close()
+    return {"message": "If the email exists, a reset code was issued"}
+
+class ResetIn(BaseModel):
+    email: str
+    code: str
+    newPassword: str
+
+@app.post("/api/password/reset")
+def password_reset(data: ResetIn):
+    conn = db()
+    r = conn.execute("SELECT * FROM password_resets WHERE email=? AND code=? AND used=0 AND expires>?",
+                     (data.email, data.code, now())).fetchone()
+    if not r:
+        conn.close()
+        raise ApiError(400, "Invalid code")
+    conn.execute("UPDATE password_resets SET used=1 WHERE email=? AND code=?", (data.email, data.code))
+    conn.execute("UPDATE users SET password_hash=? WHERE email=?",
+                 (h(data.newPassword, data.email), data.email))
+    conn.execute("DELETE FROM tokens WHERE user_id=(SELECT id FROM users WHERE email=?)", (data.email,))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.get("/api/telegram/daily-rewards/link-code")
+def tg_code(user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT * FROM telegram_claims WHERE user_id=?", (user["id"],)).fetchone()
+    today = time.strftime("%Y-%m-%d")
+    claimed = bool(r and time.strftime("%Y-%m-%d", time.localtime(r["last_claim"])) == today)
+    conn.close()
+    return {"code": "TG-" + secrets.token_hex(3).upper(), "reward": 0.5, "claimed": claimed}
+
+@app.post("/api/telegram/daily-rewards/link-code")
+def tg_claim(user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT * FROM telegram_claims WHERE user_id=?", (user["id"],)).fetchone()
+    today = time.strftime("%Y-%m-%d")
+    if r and time.strftime("%Y-%m-%d", time.localtime(r["last_claim"])) == today:
+        conn.close()
+        raise ApiError(400, "Already claimed today")
+    if r:
+        conn.execute("UPDATE telegram_claims SET last_claim=? WHERE user_id=?", (now(), user["id"]))
+    else:
+        conn.execute("INSERT INTO telegram_claims(user_id,last_claim) VALUES(?,?)", (user["id"], now()))
+    conn.execute("UPDATE users SET balance=balance+0.5 WHERE id=?", (user["id"],))
+    conn.commit(); conn.close()
+    return {"claimed": True, "reward": 0.5}
+
+@app.post("/api/upload")
+def upload(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    require_admin(user)
+    safe = "".join(ch for ch in file.filename if ch.isalnum() or ch in "._-")
+    name = f"{secrets.token_hex(6)}_{safe}"
+    with open(os.path.join(UPLOADS, name), "wb") as f:
+        f.write(file.file.read())
+    return {"url": f"/uploads/{name}"}
+
+# ================= STATIC (mount LAST) =================
+app.mount("/uploads", StaticFiles(directory=UPLOADS), name="uploads")
+app.mount("/", StaticFiles(directory=FRONTEND, html=True), name="spa")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

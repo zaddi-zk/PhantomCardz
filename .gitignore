@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+market.db
+market.db-*
+backups/
+logs/
+uploads/
+market.log
+nohup.out
+.env
+index-2.html
