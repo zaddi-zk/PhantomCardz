@@ -274,6 +274,8 @@ def ensure_schema(conn):
     conn.executescript(INDEX_SCHEMA)
     if "username" not in conn.table_columns("users"):
         conn.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    if "is_banned" not in conn.table_columns("users"):
+        conn.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
 def init_db():
@@ -400,9 +402,15 @@ def create_token(conn, user_id: int) -> str:
     conn.execute("INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)", (token, user_id, now()))
     return token
 
+def role_flags(u) -> dict:
+    # The web client expects {role, isWorker, isBanned}; the DB stores rank.
+    rank = u["rank"]
+    banned = u.get("is_banned") if hasattr(u, "get") else None
+    return {"role": rank, "isWorker": rank == "worker", "isBanned": bool(banned)}
+
 def user_out(u) -> dict:
     return {"id": u["id"], "email": u["email"], "username": u["username"],
-            "balance": u["balance"], "rank": u["rank"]}
+            "balance": u["balance"], "rank": u["rank"], **role_flags(u)}
 
 def get_setting(conn, key: str, fallback="{}"):
     r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -434,6 +442,9 @@ def login(request: Request, data: CredsIn):
     if not u or not verify_pw(data.password, data.email, u["password_hash"]):
         conn.close()
         raise ApiError(401, "Invalid email or password")
+    if u.get("is_banned"):
+        conn.close()
+        raise ApiError(403, "Account suspended")
     token = create_token(conn, u["id"])
     conn.commit()
     conn.close()
@@ -474,7 +485,8 @@ def me(user: dict = Depends(get_current_user)):
     conn.close()
     return {"id": user["id"], "email": user["email"], "username": user["username"],
             "balance": user["balance"], "rank": user["rank"],
-            "telegram": user["telegram"], "orders": n, "totalSpent": round(spent, 2)}
+            "telegram": user["telegram"], "orders": n, "totalSpent": round(spent, 2),
+            **role_flags(user)}
 
 @app.post("/api/logout")
 def logout(user: dict = Depends(get_current_user)):
@@ -1245,8 +1257,9 @@ def admin_users(user: dict = Depends(get_current_user)):
         FROM users u LEFT JOIN orders o ON o.user_id=u.id
         GROUP BY u.id ORDER BY u.id
     """).fetchall()
-    out = [{"id": r["id"], "email": r["email"], "telegram": r["telegram"], "balance": r["balance"],
-            "rank": r["rank"], "orders": r["order_count"], "createdAt": ts(r["created_at"])}
+    out = [{"id": r["id"], "email": r["email"], "username": r["username"], "telegram": r["telegram"],
+            "balance": r["balance"], "rank": r["rank"], "orders": r["order_count"],
+            "createdAt": ts(r["created_at"]), **role_flags(r)}
            for r in rows]
     conn.close()
     return out
@@ -1261,11 +1274,95 @@ def admin_patch_user(uid: int, payload: Dict[str, Any], user: dict = Depends(get
         conn.execute("UPDATE users SET rank=? WHERE id=?", (payload["rank"], uid))
     if "telegram" in payload:
         conn.execute("UPDATE users SET telegram=? WHERE id=?", (payload["telegram"], uid))
+    if "role" in payload and payload["role"] in ("user", "admin", "worker"):
+        conn.execute("UPDATE users SET rank=? WHERE id=?", (payload["role"], uid))
+    if "isWorker" in payload:
+        r0 = conn.execute("SELECT rank FROM users WHERE id=?", (uid,)).fetchone()
+        if r0 and r0["rank"] != "admin":
+            conn.execute("UPDATE users SET rank=? WHERE id=?", ("worker" if payload["isWorker"] else "user", uid))
+    if "isBanned" in payload:
+        conn.execute("UPDATE users SET is_banned=? WHERE id=?", (1 if payload["isBanned"] else 0, uid))
     r = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
     conn.commit(); audit("user_patch", user["email"], f"target={uid} fields={sorted(payload.keys())}"); conn.close()
     if not r:
         raise ApiError(404, "Not found")
-    return {"id": r["id"], "email": r["email"], "balance": r["balance"], "rank": r["rank"], "telegram": r["telegram"]}
+    return {"id": r["id"], "email": r["email"], "username": r["username"], "balance": r["balance"],
+            "rank": r["rank"], "telegram": r["telegram"], **role_flags(r)}
+
+# The web client addresses user management via dedicated action routes; keep
+# these aliases so the admin panel works against this backend.
+def _admin_target(conn, uid: int):
+    r = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not r:
+        conn.close()
+        raise ApiError(404, "Not found")
+    return r
+
+@app.post("/api/admin/users/{uid}/set-role")
+def admin_set_role(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    role = payload.get("role")
+    if role not in ("user", "admin", "worker"):
+        raise ApiError(400, "Invalid role")
+    conn = db(); _admin_target(conn, uid)
+    conn.execute("UPDATE users SET rank=? WHERE id=?", (role, uid))
+    conn.commit(); audit("user_set_role", user["email"], f"target={uid} role={role}"); conn.close()
+    return {"ok": True, "role": role, "isWorker": role == "worker"}
+
+@app.post("/api/admin/users/{uid}/set-worker")
+def admin_set_worker(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db(); r = _admin_target(conn, uid)
+    is_worker = bool(payload.get("isWorker"))
+    if r["rank"] != "admin":
+        conn.execute("UPDATE users SET rank=? WHERE id=?", ("worker" if is_worker else "user", uid))
+    conn.commit(); audit("user_set_worker", user["email"], f"target={uid} isWorker={is_worker}"); conn.close()
+    return {"ok": True, "isWorker": is_worker}
+
+@app.post("/api/admin/users/{uid}/set-balance")
+def admin_set_balance(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    try:
+        balance = float(payload.get("balance"))
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid balance")
+    conn = db(); _admin_target(conn, uid)
+    conn.execute("UPDATE users SET balance=? WHERE id=?", (balance, uid))
+    conn.commit(); audit("user_set_balance", user["email"], f"target={uid} balance={balance}"); conn.close()
+    return {"ok": True, "balance": balance}
+
+@app.post("/api/admin/users/{uid}/balance")
+def admin_set_balance_alias(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    return admin_set_balance(uid, payload, user)
+
+@app.post("/api/admin/users/{uid}/password")
+@app.patch("/api/admin/users/{uid}/password")
+def admin_set_password(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    new_password = payload.get("newPassword") or payload.get("password")
+    if not new_password:
+        raise ApiError(400, "Password required")
+    conn = db(); r = _admin_target(conn, uid)
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (h(new_password, r["email"]), uid))
+    conn.commit(); audit("user_set_password", user["email"], f"target={uid}"); conn.close()
+    return {"ok": True}
+
+@app.post("/api/admin/users/{uid}/ban")
+def admin_ban_user(uid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db(); _admin_target(conn, uid)
+    conn.execute("UPDATE users SET is_banned=1 WHERE id=?", (uid,))
+    conn.execute("DELETE FROM tokens WHERE user_id=?", (uid,))
+    conn.commit(); audit("user_ban", user["email"], f"target={uid}"); conn.close()
+    return {"ok": True, "isBanned": True}
+
+@app.post("/api/admin/users/{uid}/unban")
+def admin_unban_user(uid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db(); _admin_target(conn, uid)
+    conn.execute("UPDATE users SET is_banned=0 WHERE id=?", (uid,))
+    conn.commit(); audit("user_unban", user["email"], f"target={uid}"); conn.close()
+    return {"ok": True, "isBanned": False}
 
 @app.delete("/api/admin/users/{uid}")
 def admin_del_user(uid: int, user: dict = Depends(get_current_user)):
