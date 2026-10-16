@@ -39,6 +39,10 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: TELEGRAM_VOUCH_URL
+        sync: false
+      - key: PASSWORD_SALT
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT

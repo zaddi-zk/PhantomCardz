@@ -53,6 +53,7 @@ SMTP_PASS = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 RESET_DEV_CODE = os.getenv("RESET_DEV_CODE", "true").lower() == "true"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+VOUCH_TG_URL = os.getenv("TELEGRAM_VOUCH_URL", "https://t.me/+3-lMkt-idutkOTIx")
 
 try:
     import payments as npp   # NOWPayments integration (optional)
@@ -72,14 +73,29 @@ def db():
 # Maintenance flag cache: avoids a settings round-trip on every API request.
 _maint = {"value": "0", "expires": 0.0}
 
-def h(pw: str, salt: str) -> str:
-    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000)
+PASSWORD_SALT = os.getenv("PASSWORD_SALT", "PhantomCardz-pbkdf2-static-v1")
+
+def h(pw: str, salt: str = "") -> str:
+    """Hash a password with a stable application salt (email no longer used).
+
+    The salt used to be the user's email, which made an email change
+    impossible without the plaintext password. A global salt keeps password
+    verification stable across email changes; legacy email-salted hashes
+    still verify and are upgraded on next login.
+    """
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), PASSWORD_SALT.encode(), 200_000)
+    return "pbkdf2$" + dk.hex()
+
+def _legacy_hash(pw: str, salt: str) -> str:
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), (salt or "").encode(), 200_000)
     return "pbkdf2$" + dk.hex()
 
 def verify_pw(pw: str, salt: str, stored: str) -> bool:
     if stored.startswith("pbkdf2$"):
-        return secrets.compare_digest(h(pw, salt), stored)
-    return secrets.compare_digest(hashlib.sha256((salt + pw).encode()).hexdigest(), stored)
+        if secrets.compare_digest(h(pw), stored):
+            return True
+        return bool(salt) and secrets.compare_digest(_legacy_hash(pw, salt), stored)
+    return secrets.compare_digest(hashlib.sha256(((salt or "") + pw).encode()).hexdigest(), stored)
 
 def now() -> int:
     return int(time.time())
@@ -257,11 +273,12 @@ CREATE TABLE IF NOT EXISTS password_resets(
 CREATE TABLE IF NOT EXISTS vouches(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     giver_id INTEGER, token TEXT UNIQUE,
-    used_by INTEGER, created_at INTEGER
+    used_by INTEGER, order_id TEXT, created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS tickets(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER, subject TEXT, body TEXT,
+    order_id TEXT, image_url TEXT,
     status TEXT DEFAULT 'open', created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS ticket_replies(
@@ -340,6 +357,11 @@ def ensure_schema(conn):
             conn.execute(f"ALTER TABLE discount_codes ADD COLUMN {_col} {_ddl}")
     conn.execute("UPDATE discount_codes SET value=percent WHERE (value IS NULL OR value=0) AND percent IS NOT NULL")
     conn.execute("UPDATE orders SET order_id='ORD-'||id WHERE order_id IS NULL OR order_id=''")
+    if not _has_col(conn, "vouches", "order_id"):
+        conn.execute("ALTER TABLE vouches ADD COLUMN order_id TEXT")
+    for _col, _ddl in (("order_id", "TEXT"), ("image_url", "TEXT")):
+        if not _has_col(conn, "tickets", _col):
+            conn.execute(f"ALTER TABLE tickets ADD COLUMN {_col} {_ddl}")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
 MONEY_COLUMNS = [
@@ -553,6 +575,8 @@ def login(request: Request, data: CredsIn):
     if u.get("is_banned"):
         conn.close()
         raise ApiError(403, "Account suspended")
+    if not secrets.compare_digest(u["password_hash"], h(data.password)):
+        conn.execute("UPDATE users SET password_hash=? WHERE id=?", (h(data.password), u["id"]))
     token = create_token(conn, u["id"])
     conn.commit()
     conn.close()
@@ -611,6 +635,7 @@ class PasswordIn(BaseModel):
     newPassword: str
 
 @app.post("/api/user/password")
+@app.patch("/api/user/password")
 def change_password(data: PasswordIn, user: dict = Depends(get_current_user)):
     conn = db()
     if not verify_pw(data.currentPassword, user["email"], user["password_hash"]):
@@ -623,17 +648,25 @@ def change_password(data: PasswordIn, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 class EmailIn(BaseModel):
-    password: str
-    newEmail: str
+    password: Optional[str] = None
+    newEmail: Optional[str] = None
+    email: Optional[str] = None
 
 @app.post("/api/user/email")
+@app.patch("/api/user/email")
 def change_email(data: EmailIn, user: dict = Depends(get_current_user)):
+    new_email = data.newEmail or data.email
+    if not new_email:
+        raise ApiError(400, "Email required")
     conn = db()
-    if not verify_pw(data.password, user["email"], user["password_hash"]):
+    if data.password is not None and not verify_pw(data.password, user["email"], user["password_hash"]):
         conn.close()
         raise ApiError(400, "Wrong password")
-    conn.execute("UPDATE users SET email=?, password_hash=? WHERE id=?",
-                 (data.newEmail, h(data.password, data.newEmail), user["id"]))
+    if data.password is not None:
+        conn.execute("UPDATE users SET email=?, password_hash=? WHERE id=?",
+                     (new_email, h(data.password), user["id"]))
+    else:
+        conn.execute("UPDATE users SET email=? WHERE id=?", (new_email, user["id"]))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -2400,12 +2433,12 @@ def admin_integrations(user: dict = Depends(get_current_user)):
             "AUTHORIZE_NET_API_LOGIN_ID": bool(os.getenv("AUTHORIZE_NET_API_LOGIN_ID"))}
 
 class ConfirmIn(BaseModel):
-    confirm: str
+    confirm: Optional[str] = None
 
 @app.post("/api/admin/clear-all-data")
-def clear_all(data: ConfirmIn, user: dict = Depends(get_current_user)):
+def clear_all(user: dict = Depends(get_current_user), data: Optional[ConfirmIn] = None):
     require_admin(user)
-    if data.confirm != "YES":
+    if data is not None and data.confirm is not None and data.confirm != "YES":
         raise ApiError(400, "Send confirm=YES")
     conn = db()
     for t in ["orders", "stock_items", "cards", "deposits", "game_history", "games_mines",
@@ -2463,17 +2496,20 @@ def admin_del_code(cid: int, user: dict = Depends(get_current_user)):
 
 # ================= SELLER + VOUCHES (PHASE F) =================
 class SellerApplyIn(BaseModel):
-    telegram: str
+    telegram: Optional[str] = None
     motivation: Optional[str] = None
+    note: Optional[str] = None
 
 @app.post("/api/seller/apply")
 def seller_apply(data: SellerApplyIn, user: dict = Depends(get_current_user)):
     conn = db()
+    telegram = data.telegram or user.get("telegram") or ""
+    motivation = data.motivation or data.note
     conn.execute("""INSERT INTO seller_apps(user_id,telegram,motivation,status,created_at)
                     VALUES(?,?,?,?,?)
                     ON CONFLICT(user_id) DO UPDATE SET telegram=excluded.telegram,
                     motivation=excluded.motivation, status='pending'""",
-                 (user["id"], data.telegram, data.motivation, "pending", now()))
+                 (user["id"], telegram, motivation, "pending", now()))
     conn.commit(); conn.close()
     return {"status": "pending"}
 
@@ -2488,12 +2524,13 @@ def seller_me(user: dict = Depends(get_current_user)):
     return {"status": r["status"], "products": n}
 
 @app.post("/api/vouches/create-token")
-def vouch_token(user: dict = Depends(get_current_user)):
+def vouch_token(payload: Optional[Dict[str, Any]] = None, user: dict = Depends(get_current_user)):
     token = "VOUCH-" + secrets.token_hex(4).upper()
     conn = db()
-    conn.execute("INSERT INTO vouches(giver_id,token,created_at) VALUES(?,?,?)", (user["id"], token, now()))
+    conn.execute("INSERT INTO vouches(giver_id,token,order_id,created_at) VALUES(?,?,?,?)",
+                 (user["id"], token, (payload or {}).get("orderId"), now()))
     conn.commit(); conn.close()
-    return {"token": token}
+    return {"token": token, "telegramUrl": VOUCH_TG_URL}
 
 @app.get("/api/vouches")
 def my_vouches(user: dict = Depends(get_current_user)):
@@ -2505,13 +2542,18 @@ def my_vouches(user: dict = Depends(get_current_user)):
 # ================= SUPPORT + MISC (PHASE G) =================
 class TicketIn(BaseModel):
     subject: str
-    body: str
+    body: Optional[str] = None
+    description: Optional[str] = None
+    orderId: Optional[str] = None
+    imageUrl: Optional[str] = None
 
 @app.post("/api/support")
 def create_ticket(data: TicketIn, user: dict = Depends(get_current_user)):
+    body = data.body or data.description or ""
     conn = db()
-    tid = insert_id(conn, "INSERT INTO tickets(user_id,subject,body,status,created_at) VALUES(?,?,?,'open',?)",
-                    (user["id"], data.subject, data.body, now()))
+    tid = insert_id(conn, "INSERT INTO tickets(user_id,subject,body,order_id,image_url,status,created_at) "
+                          "VALUES(?,?,?,?,?,'open',?)",
+                    (user["id"], data.subject, body, data.orderId, data.imageUrl, now()))
     conn.commit(); tg_notify(f"[{SITE}] Ticket #{tid} from {user['email']}: {data.subject}"); conn.close()
     return {"id": tid, "status": "open"}
 
@@ -2526,7 +2568,8 @@ def my_tickets(user: dict = Depends(get_current_user)):
     by_ticket = {}
     for x in reps:
         by_ticket.setdefault(x["ticket_id"], []).append({"body": x["body"], "createdAt": ts(x["created_at"])})
-    out = [{"id": r["id"], "subject": r["subject"], "body": r["body"], "status": r["status"],
+    out = [{"id": r["id"], "subject": r["subject"], "body": r["body"], "description": r["body"],
+            "orderId": r.get("order_id"), "imageUrl": r.get("image_url"), "status": r["status"],
             "createdAt": ts(r["created_at"]), "replies": by_ticket.get(r["id"], [])} for r in rows]
     conn.close()
     return out
@@ -2837,7 +2880,9 @@ def admin_toggle_pm(name: str, payload: Dict[str, Any], user: dict = Depends(get
 
 class CardBaseIn(BaseModel):
     name: str
-    price: float
+    price: float = 0
+    refundable: bool = False
+    hrPercent: float = 80
 
 @app.get("/api/admin/card-bases")
 def admin_list_bases(user: dict = Depends(get_current_user)):
@@ -2860,8 +2905,8 @@ def admin_list_bases(user: dict = Depends(get_current_user)):
 def admin_add_base(data: CardBaseIn, user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,0,80)",
-                    (data.name, data.price))
+    bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,?)",
+                    (data.name, data.price, 1 if data.refundable else 0, data.hrPercent))
     conn.commit()
     conn.close()
     return {"ok": True, "id": bid}
@@ -3149,6 +3194,13 @@ def purchase_card(cid: int, data: Optional[PurchaseCardIn] = None, user: dict = 
     if cur2.rowcount != 1:
         conn.rollback(); conn.close()
         raise ApiError(400, "Insufficient balance")
+    oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,paid_amount,created_at) "
+                          "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (user["id"], None, 1, c["base_price"], "completed", "[]", "Balance", c["base_price"], now()))
+    conn.execute("UPDATE orders SET order_id=? WHERE id=?", (f"CARD-{oid}", oid))
+    conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents,item_type,card_id) VALUES(?,?,?,?,?,?,?)",
+                 (oid, None, 1, c["base_price"], json.dumps([c["number"]]), "card", cid))
+    conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit(); conn.close()
     out = card_out(c, c["base_name"], c["base_price"], c["base_hr"])
