@@ -379,12 +379,24 @@ def init_db():
             "ethereum": ETH_ADDR,
             "litecoin": LTC_ADDR}),
         "min_deposits": json.dumps({"cashapp": 5, "crypto": 10}),
-        "features": json.dumps({"checker": True, "reseller": True, "ranks": True, "logs": True, "cards": True, "plinko": False}),
+        "features": json.dumps({"checker": True, "reseller": True, "ranks": True, "logs": True, "cards": True, "plinko": True}),
         "payment_methods": json.dumps({"wallet": True, "cashapp": True, "crypto": True, "stars": False,
                                        "venmo": False, "zelle": False, "chime": True, "applepay": False}),
     }
     for k, v in defaults.items():
         c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO NOTHING", (k, v))
+    # One-time: the games feature was historically seeded off. Flip Plinko on so
+    # the game unlocks; admins can still turn it back off from the panel.
+    if get_setting(conn, "features_plinko_default", "") != "1":
+        try:
+            feats = json.loads(get_setting(conn, "features", "{}")) or {}
+        except Exception:
+            feats = {}
+        feats["plinko"] = True
+        c.execute("INSERT INTO settings(key,value) VALUES(?,?) "
+                  "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                  ("features", json.dumps(feats)))
+        set_setting(conn, "features_plinko_default", "1")
     conn.commit()
     conn.close()
 
@@ -1394,33 +1406,33 @@ class PlinkoIn(BaseModel):
     betAmount: Optional[float] = None
     risk: str = "low"
 
-    def bet(self) -> float:
-        return float(self.betAmount if self.betAmount is not None else self.amount)
+    def bet(self) -> int:
+        return int(round(float(self.betAmount if self.betAmount is not None else self.amount)))
+
+# 8 fair rows -> 9 slots. Matches the frozen client's payout table (house edge ~3.8%).
+PLINKO_TABLE = [3, 2.2, 1.3, 0.9, 0.45, 0.9, 1.3, 2.2, 3]
 
 @app.post("/api/games/plinko")
 def game_plinko(data: PlinkoIn, user: dict = Depends(get_current_user)):
-    amount = data.bet()
-    if amount <= 0: raise ApiError(400, "Invalid amount")
-    tables = {
-        "low":  [16, 9, 2, 1.4, 1.4, 1.2, 1.1, 1.0, 0.5, 1.0, 1.1, 1.2, 1.4, 1.4, 2, 9, 16],
-        "high": [1000, 130, 26, 9, 4, 2, 0.2, 0.2, 0.2, 0.2, 0.2, 2, 4, 9, 26, 130, 1000],
-    }
-    tbl = tables.get(data.risk, tables["low"])
+    bet = data.bet()
+    if bet <= 0: raise ApiError(400, "Invalid amount")
+    path = [random.randint(0, 1) for _ in range(8)]
+    slot = sum(path)
+    mult = PLINKO_TABLE[slot]
     conn = db()
     cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
-                       (amount, user["id"], amount))
+                       (bet, user["id"], bet))
     if cur.rowcount != 1:
         conn.rollback(); conn.close()
         raise ApiError(400, "Insufficient balance")
-    pos = sum(1 for _ in range(16) if random.random() < 0.5)
-    payout = round(amount * tbl[pos], 2)
+    payout = int(round(bet * mult))
     conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (payout, user["id"]))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.execute("INSERT INTO game_history(user_id,game,amount,payout,created_at) VALUES(?,?,?,?,?)",
-                 (user["id"], "plinko", amount, payout, now()))
+                 (user["id"], "plinko", bet, payout, now()))
     conn.commit(); conn.close()
-    return {"bucket": pos, "multiplier": tbl[pos], "payout": payout, "won": payout > 0,
-            "newBalance": int(round(u["balance"]))}
+    return {"path": path, "slot": slot, "bucket": slot, "multiplier": mult, "payout": payout,
+            "profit": payout - bet, "won": payout > bet, "newBalance": int(round(u["balance"]))}
 
 @app.get("/api/games/history")
 def game_history_list(user: dict = Depends(get_current_user)):
