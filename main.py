@@ -62,6 +62,9 @@ class ApiError(Exception):
 def db():
     return connect_db(DB_PATH)
 
+# Maintenance flag cache: avoids a settings round-trip on every API request.
+_maint = {"value": "0", "expires": 0.0}
+
 def h(pw: str, salt: str) -> str:
     dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt.encode(), 200_000)
     return "pbkdf2$" + dk.hex()
@@ -277,9 +280,14 @@ def init_db():
     conn = db()
     ensure_schema(conn)
     c = conn.cursor()
-    if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+    # Guarantee the configured admin account exists and can reach /admin.
+    admin_row = c.execute("SELECT id, rank FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
+    if admin_row is None:
         c.execute("INSERT INTO users(email,password_hash,telegram,balance,rank,created_at) VALUES(?,?,?,?,?,?)",
                   (ADMIN_EMAIL, h(ADMIN_PASS, ADMIN_EMAIL), ADMIN_TG, 1000.0, "admin", now()))
+    elif admin_row["rank"] != "admin":
+        c.execute("UPDATE users SET rank='admin' WHERE id=?", (admin_row["id"],))
+        audit("admin_promote", ADMIN_EMAIL, "startup rank repair")
     missing_usernames = c.execute(
         "SELECT id FROM users WHERE username IS NULL OR TRIM(username)=''"
     ).fetchall()
@@ -345,10 +353,12 @@ app.add_middleware(CORSMiddleware,
 async def maintenance_gate(request: Request, call_next):
     path = request.url.path
     if path.startswith("/api") and path not in ("/api/health", "/api/health/", "/api/login", "/api/admin/settings/maintenance"):
-        conn = db()
-        m = get_setting(conn, "maintenance", "0")
-        conn.close()
-        if m == "1":
+        if time.time() >= _maint["expires"]:
+            conn = db()
+            _maint["value"] = get_setting(conn, "maintenance", "0")
+            conn.close()
+            _maint["expires"] = time.time() + 2.0
+        if _maint["value"] == "1":
             return JSONResponse({"message": "Maintenance mode, back soon"}, status_code=503)
     return await call_next(request)
 
@@ -374,11 +384,8 @@ def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials
     if not token:
         raise ApiError(401, "No auth")
     conn = db()
-    t = conn.execute("SELECT user_id FROM tokens WHERE token=?", (token,)).fetchone()
-    if not t:
-        conn.close()
-        raise ApiError(401, "Invalid token")
-    u = conn.execute("SELECT * FROM users WHERE id=?", (t["user_id"],)).fetchone()
+    u = conn.execute("SELECT u.* FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.token=?",
+                     (token,)).fetchone()
     conn.close()
     if not u:
         raise ApiError(401, "Invalid token")
@@ -404,6 +411,8 @@ def get_setting(conn, key: str, fallback="{}"):
 def set_setting(conn, key: str, value: str):
     conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                  (key, value))
+    if key == "maintenance":
+        _maint["expires"] = 0.0
 
 # ================= AUTH =================
 class CredsIn(BaseModel):
@@ -545,18 +554,19 @@ def announcements():
 def products():
     conn = db()
     rows = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY pinned DESC, id DESC").fetchall()
-    out = []
-    for r in rows:
-        vs = conn.execute("SELECT * FROM variants WHERE productId=?", (r["id"],)).fetchall()
-        vv = []
-        for v in vs:
-            sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0",
-                              (v["id"],)).fetchone()[0]
-            vv.append({"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
-                      "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": sc})
-        out.append({"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
-                    "active": bool(r["active"]), "pinned": bool(r["pinned"]), "createdAt": ts(r["created_at"]),
-                    "variants": vv})
+    vs = conn.execute("""
+        SELECT v.*, (SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count
+        FROM variants v JOIN products p ON p.id=v.productId
+        WHERE p.active=1 ORDER BY v.id
+    """).fetchall()
+    by_product = {}
+    for v in vs:
+        by_product.setdefault(v["productId"], []).append(
+            {"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
+             "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": v["stock_count"]})
+    out = [{"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
+            "active": bool(r["active"]), "pinned": bool(r["pinned"]), "createdAt": ts(r["created_at"]),
+            "variants": by_product.get(r["id"], [])} for r in rows]
     conn.close()
     return out
 
@@ -664,10 +674,12 @@ def image(image_id: int):
 @app.get("/api/stock")
 def stock_totals():
     conn = db()
-    p = conn.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
-    s = conn.execute("SELECT COUNT(*) FROM stock_items WHERE sold=0").fetchone()[0]
+    row = conn.execute("""
+        SELECT (SELECT COUNT(*) FROM products WHERE active=1) AS products,
+               (SELECT COUNT(*) FROM stock_items WHERE sold=0) AS items
+    """).fetchone()
     conn.close()
-    return {"products": p, "itemsInStock": s}
+    return {"products": row["products"], "itemsInStock": row["items"]}
 
 # ================= ORDERS (PHASE A) =================
 class OrderIn(BaseModel):
@@ -957,11 +969,11 @@ def my_deposits(user: dict = Depends(get_current_user)):
 @app.get("/api/card-bases")
 def card_bases():
     conn = db()
-    rows = conn.execute("SELECT * FROM card_bases WHERE active=1").fetchall()
-    out = []
-    for r in rows:
-        sc = conn.execute("SELECT COUNT(*) FROM cards WHERE base_id=? AND sold=0", (r["id"],)).fetchone()[0]
-        out.append({"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": sc})
+    rows = conn.execute("""
+        SELECT b.*, (SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count
+        FROM card_bases b WHERE b.active=1
+    """).fetchall()
+    out = [{"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": r["stock_count"]} for r in rows]
     conn.close()
     return out
 
@@ -1207,29 +1219,35 @@ def game_history_list(user: dict = Depends(get_current_user)):
 def admin_dashboard(user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    orders = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
-    deps = conn.execute("SELECT COUNT(*) FROM deposits").fetchone()[0]
-    pend = conn.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
-    rev = conn.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE status='completed'").fetchone()[0]
-    cards_sold = conn.execute("SELECT COUNT(*) FROM cards WHERE sold=1").fetchone()[0]
-    bal = conn.execute("SELECT COALESCE(SUM(balance),0) FROM users").fetchone()[0]
-    grev = conn.execute("SELECT COALESCE(SUM(amount-payout),0) FROM game_history").fetchone()[0]
+    row = conn.execute("""
+        SELECT
+          (SELECT COUNT(*) FROM users)                                   AS users,
+          (SELECT COUNT(*) FROM orders)                                  AS orders,
+          (SELECT COUNT(*) FROM deposits)                                AS deposits,
+          (SELECT COUNT(*) FROM deposits WHERE status='pending')         AS pending,
+          (SELECT COALESCE(SUM(total),0) FROM orders WHERE status='completed') AS revenue,
+          (SELECT COUNT(*) FROM cards WHERE sold=1)                      AS cards_sold,
+          (SELECT COALESCE(SUM(balance),0) FROM users)                   AS balance,
+          (SELECT COALESCE(SUM(amount-payout),0) FROM game_history)      AS games_revenue
+    """).fetchone()
     conn.close()
-    return {"users": users, "orders": orders, "deposits": deps, "pendingDeposits": pend,
-            "revenue": round(rev, 2), "cardsSold": cards_sold, "balance": round(bal, 2),
-            "gamesRevenue": round(grev, 2)}
+    return {"users": row["users"], "orders": row["orders"], "deposits": row["deposits"],
+            "pendingDeposits": row["pending"], "revenue": round(row["revenue"], 2),
+            "cardsSold": row["cards_sold"], "balance": round(row["balance"], 2),
+            "gamesRevenue": round(row["games_revenue"], 2)}
 
 @app.get("/api/admin/users")
 def admin_users(user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
-    rows = conn.execute("SELECT * FROM users ORDER BY id").fetchall()
-    out = []
-    for r in rows:
-        n = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (r["id"],)).fetchone()[0]
-        out.append({"id": r["id"], "email": r["email"], "telegram": r["telegram"], "balance": r["balance"],
-                    "rank": r["rank"], "orders": n, "createdAt": ts(r["created_at"])})
+    rows = conn.execute("""
+        SELECT u.*, COUNT(o.id) AS order_count
+        FROM users u LEFT JOIN orders o ON o.user_id=u.id
+        GROUP BY u.id ORDER BY u.id
+    """).fetchall()
+    out = [{"id": r["id"], "email": r["email"], "telegram": r["telegram"], "balance": r["balance"],
+            "rank": r["rank"], "orders": r["order_count"], "createdAt": ts(r["created_at"])}
+           for r in rows]
     conn.close()
     return out
 
@@ -1263,17 +1281,17 @@ def admin_products(user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
     rows = conn.execute("SELECT * FROM products ORDER BY id DESC").fetchall()
-    out = []
-    for r in rows:
-        vs = conn.execute("SELECT * FROM variants WHERE productId=?", (r["id"],)).fetchall()
-        vv = []
-        for v in vs:
-            sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0",
-                              (v["id"],)).fetchone()[0]
-            vv.append({"id": v["id"], "name": v["name"], "price": v["price"], "stockCount": sc})
-        out.append({"id": r["id"], "name": r["name"], "description": r["description"],
-                    "image": r["image"], "active": bool(r["active"]), "pinned": bool(r["pinned"]),
-                    "variants": vv})
+    vs = conn.execute("""
+        SELECT v.*, (SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count
+        FROM variants v ORDER BY v.id
+    """).fetchall()
+    by_product = {}
+    for v in vs:
+        by_product.setdefault(v["productId"], []).append(
+            {"id": v["id"], "name": v["name"], "price": v["price"], "stockCount": v["stock_count"]})
+    out = [{"id": r["id"], "name": r["name"], "description": r["description"],
+            "image": r["image"], "active": bool(r["active"]), "pinned": bool(r["pinned"]),
+            "variants": by_product.get(r["id"], [])} for r in rows]
     conn.close()
     return out
 
@@ -1615,12 +1633,15 @@ def create_ticket(data: TicketIn, user: dict = Depends(get_current_user)):
 def my_tickets(user: dict = Depends(get_current_user)):
     conn = db()
     rows = conn.execute("SELECT * FROM tickets WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
-    out = []
-    for r in rows:
-        reps = conn.execute("SELECT * FROM ticket_replies WHERE ticket_id=? ORDER BY id", (r["id"],)).fetchall()
-        out.append({"id": r["id"], "subject": r["subject"], "body": r["body"], "status": r["status"],
-                    "createdAt": ts(r["created_at"]),
-                    "replies": [{"body": x["body"], "createdAt": ts(x["created_at"])} for x in reps]})
+    reps = conn.execute("""
+        SELECT r.* FROM ticket_replies r JOIN tickets t ON t.id=r.ticket_id
+        WHERE t.user_id=? ORDER BY r.id
+    """, (user["id"],)).fetchall()
+    by_ticket = {}
+    for x in reps:
+        by_ticket.setdefault(x["ticket_id"], []).append({"body": x["body"], "createdAt": ts(x["created_at"])})
+    out = [{"id": r["id"], "subject": r["subject"], "body": r["body"], "status": r["status"],
+            "createdAt": ts(r["created_at"]), "replies": by_ticket.get(r["id"], [])} for r in rows]
     conn.close()
     return out
 
@@ -1742,12 +1763,13 @@ def product_get(pid: int):
     if not r:
         conn.close()
         raise ApiError(404, "Not found")
-    vs = conn.execute("SELECT * FROM variants WHERE productId=?", (pid,)).fetchall()
-    vv = []
-    for v in vs:
-        sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0", (v["id"],)).fetchone()[0]
-        vv.append({"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
-                  "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": sc})
+    vs = conn.execute("""
+        SELECT v.*, (SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count
+        FROM variants v WHERE v.productId=? ORDER BY v.id
+    """, (pid,)).fetchall()
+    vv = [{"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
+           "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": v["stock_count"]}
+          for v in vs]
     conn.close()
     return {"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
             "active": bool(r["active"]), "pinned": bool(r["pinned"]), "createdAt": ts(r["created_at"]),
@@ -1802,12 +1824,13 @@ def order_crypto(data: CryptoOrderIn, user: dict = Depends(get_current_user)):
 @app.get("/api/variants")
 def variants_list():
     conn = db()
-    rows = conn.execute("SELECT * FROM variants").fetchall()
-    out = []
-    for v in rows:
-        sc = conn.execute("SELECT COUNT(*) FROM stock_items WHERE variant_id=? AND sold=0", (v["id"],)).fetchone()[0]
-        out.append({"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
-                    "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": sc})
+    rows = conn.execute("""
+        SELECT v.*, (SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count
+        FROM variants v
+    """).fetchall()
+    out = [{"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
+            "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"], "stockCount": v["stock_count"]}
+           for v in rows]
     conn.close()
     return out
 
@@ -2017,11 +2040,11 @@ def worker_bases(user: dict = Depends(get_current_user)):
     if user["rank"] not in ("admin", "worker"):
         raise ApiError(403, "Worker or admin only")
     conn = db()
-    rows = conn.execute("SELECT * FROM card_bases WHERE active=1").fetchall()
-    out = []
-    for r in rows:
-        sc = conn.execute("SELECT COUNT(*) FROM cards WHERE base_id=? AND sold=0", (r["id"],)).fetchone()[0]
-        out.append({"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": sc})
+    rows = conn.execute("""
+        SELECT b.*, (SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count
+        FROM card_bases b WHERE b.active=1
+    """).fetchall()
+    out = [{"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": r["stock_count"]} for r in rows]
     conn.close()
     return out
 

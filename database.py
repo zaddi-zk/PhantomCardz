@@ -255,8 +255,9 @@ def _postgres_pool():
                 # URL itself; ``check_connection`` pings borrowed connections.
                 _pool = ConnectionPool(
                     DATABASE_URL,
-                    min_size=0,
-                    max_size=5,
+                    min_size=2,
+                    max_size=10,
+                    max_idle=300,
                     timeout=30,
                     check=ConnectionPool.check_connection,
                     open=True,
