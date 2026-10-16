@@ -76,6 +76,10 @@ edit. `.env` is git-ignored; `.env.example` is committed.
 | `BTC_ADDRESS`    | Default BTC address in `manual_payments` defaults             | `bc1qphantom…dead`                                               |
 | `ETH_ADDRESS`    | Default ETH address in `manual_payments` defaults             | `0xPhantom…dead`                                                 |
 | `LTC_ADDRESS`    | Default LTC address in `manual_payments` defaults             | `ltc1qphantom…dead`                                              |
+| `NOWPAYMENTS_API_KEY` | Enables real-time crypto via NOWPayments (blank = static addresses + manual approval) | *(empty)*        |
+| `NOWPAYMENTS_IPN_SECRET` | HMAC secret that verifies NOWPayments IPN callbacks      | *(empty)*                                                        |
+| `NOWPAYMENTS_API_BASE` | Override API host (sandbox: `https://api-sandbox.nowpayments.io`) | `https://api.nowpayments.io`                            |
+| `PUBLIC_BASE_URL` | Public origin used for the NOWPayments IPN callback URL      | *(falls back to `ALLOWED_HOSTS[0]`)*                             |
 | `ALLOWED_HOSTS`  | TrustedHost + CORS allow-list (comma-separated)               | `phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1`        |
 | `COOKIE_SECURE`  | Set `session` cookie `Secure` flag (requires HTTPS)           | `false`                                                          |
 | `TELEGRAM_BOT_TOKEN` | Bot token for order/deposit/ticket notifications (blank = off) | *(empty)*                                                    |
@@ -134,10 +138,14 @@ Keeps the 14 most recent archives. Back up `uploads/` separately if you allow up
 - **Auth**: `POST /api/login`, `POST /api/register`, `POST /api/logout`, `GET /api/user`,
   `GET /api/user/rank` (includes `discountPct`)
 - **Catalog**: `GET /api/products`, `GET /api/stock`, `GET /api/card-bases`
-- **Orders / wallet**: `POST /api/orders`, `GET /api/orders`, `GET /api/orders/export`,
+- **Orders / wallet**: `POST /api/orders` (instant balance checkout — accepts
+  `{variantId, quantity}` or the SPA shape `{items:[{variantId, quantity}], cardIds}`),
+  `GET /api/orders`, `GET /api/orders/export`, `POST /api/orders/{id}/live-check`,
   `POST /api/wallet/redeem`, `GET /api/wallet/transactions`
-- **Deposits**: `POST /api/orders/cashapp`, `POST /api/payments/crypto/create`,
-  `GET /api/payments/crypto/{id}/status`, `GET /api/payments/crypto/currencies`
+- **Deposits**: `POST /api/orders/cashapp`, `POST /api/orders/crypto`,
+  `POST /api/payments/crypto/create`, `GET /api/payments/crypto/{id}`,
+  `GET /api/payments/crypto/{id}/status`, `GET /api/payments/crypto/status`,
+  `GET /api/payments/crypto/currencies`, `POST /api/payments/webhook/nowpayments`
 - **Cards / checker**: `POST /api/cards`, `GET /api/user/cards`, `POST /api/checker/check`
 - **Games**: `POST /api/games/{dice,spin,mines,plinko}`, `GET /api/games/history`
 - **Admin**: `/api/admin/*` (dashboard, users, products, variants, stock, deposits,

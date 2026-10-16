@@ -125,7 +125,30 @@ so the code is never returned in the API response. Locally (no SMTP), leaving
 `RESET_DEV_CODE` at its default (`true`) returns a `devCode` for convenience — this
 is for development only.
 
-## 8. Backups
+## 8. Real-time crypto payments (NOWPayments)
+
+Out of the box, crypto deposits show a static address and require an admin to
+approve them manually. To automate crediting/fulfillment, enable NOWPayments:
+
+1. Create a NOWPayments account and generate an **API key** (Store settings → API keys).
+2. Set the **IPN callback URL** to `https://<your-domain>/api/payments/webhook/nowpayments`
+   and copy the **IPN secret key**.
+3. Set these env vars on Render (see `render.yaml`, all `sync: false`):
+
+```
+NOWPAYMENTS_API_KEY=<api key>
+NOWPAYMENTS_IPN_SECRET=<ipn secret>
+PUBLIC_BASE_URL=https://phantomcardz.cc
+# NOWPAYMENTS_API_BASE=https://api-sandbox.nowpayments.io   # sandbox only
+```
+
+With a key set, `POST /api/payments/crypto/create` creates a hosted invoice and
+returns a live `payAddress`/`payAmount`/`checkoutUrl`. Status is refreshed from
+the provider on poll (`GET /api/payments/crypto/{id}/status`) and pushed via the
+IPN webhook. A confirmed payment settles **idempotently**: it completes the linked
+order (reference `ORD<orderId>-…`) or credits the user's balance exactly once.
+
+## 9. Backups
 
 - **Postgres (Supabase):** Supabase takes **daily backups** (and point-in-time
   recovery on paid plans) — manage/verify these in the Supabase dashboard. The

@@ -49,3 +49,11 @@ services:
         sync: false
       - key: SMTP_FROM
         sync: false
+      - key: PUBLIC_BASE_URL
+        value: https://phantomcardz.cc
+      - key: NOWPAYMENTS_API_KEY
+        sync: false
+      - key: NOWPAYMENTS_IPN_SECRET
+        sync: false
+      - key: NOWPAYMENTS_API_BASE
+        sync: false

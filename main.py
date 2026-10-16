@@ -51,6 +51,12 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 RESET_DEV_CODE = os.getenv("RESET_DEV_CODE", "true").lower() == "true"
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+try:
+    import payments as npp   # NOWPayments integration (optional)
+except Exception:            # pragma: no cover - optional dependency
+    npp = None
 
 security = HTTPBearer(auto_error=False)
 
@@ -295,6 +301,14 @@ def ensure_schema(conn):
         conn.execute("ALTER TABLE card_bases ADD COLUMN refundable INTEGER DEFAULT 0")
     if not _has_col(conn, "card_bases", "hrPercent"):
         conn.execute("ALTER TABLE card_bases ADD COLUMN hrPercent REAL DEFAULT 0")
+    # Payment-provider tracking (NOWPayments). Added lazily for existing DBs.
+    for _col, _ddl in (("provider", "TEXT"), ("provider_id", "TEXT"),
+                       ("pay_currency", "TEXT"), ("pay_amount", "TEXT"),
+                       ("pay_address", "TEXT"), ("payin_extra_id", "TEXT"),
+                       ("checkout_url", "TEXT"), ("meta", "TEXT"),
+                       ("updated_at", "INTEGER"), ("settled_at", "INTEGER")):
+        if not _has_col(conn, "deposits", _col):
+            conn.execute(f"ALTER TABLE deposits ADD COLUMN {_col} {_ddl}")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
 MONEY_COLUMNS = [
@@ -758,57 +772,109 @@ def stock_totals():
 
 # ================= ORDERS (PHASE A) =================
 class OrderIn(BaseModel):
-    variantId: int
+    variantId: Optional[int] = None
     quantity: int = 1
     code: Optional[str] = None
+    items: Optional[List[Dict[str, Any]]] = None
+    cardIds: Optional[List[int]] = None
+    discountCodeId: Optional[int] = None
 
 @app.post("/api/orders")
 def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
-    if data.quantity < 1 or data.variantId <= 0:
+    """Instant balance checkout: debit the wallet, release the products.
+
+    Accepts both the legacy ``{variantId, quantity}`` shape and the SPA's
+    ``{items:[{variantId, quantity}], cardIds:[]}`` shape. Everything runs in a
+    single transaction with the balance guard, so a product can never be
+    released without the funds being taken (and vice versa).
+    """
+    raw_items = []
+    if data.items:
+        for it in data.items:
+            try:
+                raw_items.append((int(it.get("variantId")), max(1, int(it.get("quantity", 1)))))
+            except (TypeError, ValueError, AttributeError):
+                raise ApiError(400, "Invalid item")
+    elif data.variantId:
+        raw_items.append((int(data.variantId), max(1, int(data.quantity or 1))))
+    card_ids = [int(c) for c in (data.cardIds or [])]
+    if not raw_items and not card_ids:
         raise ApiError(400, "Invalid order")
     conn = db()
-    v = conn.execute("SELECT * FROM variants WHERE id=?", (data.variantId,)).fetchone()
-    if not v:
-        conn.close()
-        raise ApiError(404, "Not found")
-    stock_query = "SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?"
-    if conn.is_postgres:
-        stock_query += " FOR UPDATE SKIP LOCKED"
-    stock = conn.execute(stock_query, (data.variantId, data.quantity)).fetchall()
-    if len(stock) < data.quantity:
-        conn.close()
-        raise ApiError(400, "Insufficient stock")
-    total = v["price"] * data.quantity
-    if data.code:
-        d = conn.execute("SELECT * FROM discount_codes WHERE code=? AND active=1", (data.code,)).fetchone()
-        if d:
-            total = total * (1 - d["percent"] / 100.0)
-    total = round(total, 2)
-    claimed = []
-    for s in stock:
-        cur = conn.execute("UPDATE stock_items SET sold=1, order_id=NULL WHERE id=? AND sold=0", (s["id"],))
-        if cur.rowcount == 1:
-            claimed.append(s)
-    if len(claimed) < data.quantity:
-        conn.rollback(); conn.close()
-        raise ApiError(400, "Insufficient stock")
-    cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
-                       (total, user["id"], total))
-    if cur.rowcount != 1:
-        conn.rollback(); conn.close()
-        raise ApiError(400, "Insufficient balance")
-    items = [s["content"] for s in claimed]
-    oid = insert_id(
-        conn,
-        "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) VALUES(?,?,?,?,?,?,?)",
-        (user["id"], data.variantId, data.quantity, total, "completed", json.dumps(items), now()))
-    for s in claimed:
-        conn.execute("UPDATE stock_items SET order_id=? WHERE id=?", (oid, s["id"]))
-    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
-    conn.commit()
+    try:
+        total = 0.0
+        reserved = []
+        for vid, qty in raw_items:
+            if qty < 1 or vid <= 0:
+                raise ApiError(400, "Invalid order")
+            v = conn.execute("SELECT * FROM variants WHERE id=?", (vid,)).fetchone()
+            if not v:
+                raise ApiError(404, "Variant not found")
+            q = "SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?"
+            if conn.is_postgres:
+                q += " FOR UPDATE SKIP LOCKED"
+            rows = conn.execute(q, (v["id"], qty)).fetchall()
+            if len(rows) < qty:
+                raise ApiError(400, "Insufficient stock")
+            total += float(v["price"]) * qty
+            reserved.append((v, qty, rows))
+        card_rows = []
+        for cid in card_ids:
+            c = conn.execute("SELECT ca.*, cb.name AS base_name, cb.price AS base_price, cb.hrPercent AS base_hr "
+                             "FROM cards ca JOIN card_bases cb ON cb.id=ca.base_id "
+                             "WHERE ca.id=? AND ca.sold=0 AND cb.active=1", (cid,)).fetchone()
+            if not c:
+                raise ApiError(400, "Card out of stock")
+            total += float(c["base_price"])
+            card_rows.append(c)
+        if data.discountCodeId:
+            d = conn.execute("SELECT * FROM discount_codes WHERE id=? AND active=1", (data.discountCodeId,)).fetchone()
+            if d:
+                total *= (1 - d["percent"] / 100.0)
+        elif data.code:
+            d = conn.execute("SELECT * FROM discount_codes WHERE code=? AND active=1", (data.code,)).fetchone()
+            if d:
+                total *= (1 - d["percent"] / 100.0)
+        total = round(total, 2)
+        # Debit first, guarded by balance>=total, so the wallet can't go negative.
+        cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                           (total, user["id"], total))
+        if cur.rowcount != 1:
+            raise ApiError(400, "Insufficient balance")
+        first_vid = reserved[0][0]["id"] if reserved else None
+        qty_total = sum(q for _, q, _ in reserved)
+        items = []
+        oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,created_at) "
+                              "VALUES(?,?,?,?,?,?,?)",
+                        (user["id"], first_vid, qty_total, total, "completed", "[]", now()))
+        for v, qty, rows in reserved:
+            picked = []
+            for s in rows:
+                c2 = conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=? AND sold=0", (oid, s["id"]))
+                if c2.rowcount == 1:
+                    picked.append(s)
+            if len(picked) < qty:
+                raise ApiError(400, "Insufficient stock")
+            piece = [s["content"] for s in picked]
+            items.extend(piece)
+            conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents) VALUES(?,?,?,?,?)",
+                         (oid, v["id"], qty, v["price"], json.dumps(piece)))
+        for c in card_rows:
+            c2 = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0", (user["id"], c["id"]))
+            if c2.rowcount != 1:
+                raise ApiError(400, "Card just sold, try again")
+            items.append(c["number"])
+        conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps(items), oid))
+        u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+        conn.commit()
+    except ApiError:
+        conn.rollback(); conn.close(); raise
+    except Exception:
+        conn.rollback(); conn.close(); raise
     conn.close()
-    tg_notify(f"[{SITE}] ORDER #{oid} by {user['email']}: {data.quantity}x variant {data.variantId} = ${total}")
-    return {"id": oid, "items": items, "total": total, "newBalance": int(round(u["balance"]))}
+    tg_notify(f"[{SITE}] ORDER #{oid} by {user['email']}: {qty_total or len(card_rows)} item(s) = ${total / 100:.2f}")
+    return {"id": oid, "items": items, "total": total,
+            "newBalance": int(round(u["balance"])), "status": "completed"}
 
 @app.get("/api/orders")
 def my_orders(user: dict = Depends(get_current_user)):
@@ -1008,26 +1074,140 @@ class CryptoIn(BaseModel):
     currency: str = "BTC"
     payCurrency: Optional[str] = None
     purpose: Optional[str] = None
+    orderId: Optional[int] = None
+
+def _linked_order_id(ref: str):
+    """Order id encoded in a deposit reference like ``ORD42-AB12CD``."""
+    if ref and ref.startswith("ORD"):
+        try:
+            return int(ref.split("-")[0][3:])
+        except Exception:
+            return None
+    return None
+
+def _client_status(s: str) -> str:
+    """Map an internal deposit status to the value the SPA's poller expects."""
+    return {"approved": "completed", "rejected": "failed", "cancelled": "failed",
+            "failed": "failed", "expired": "expired", "underpaid": "underpaid",
+            "pending": "pending"}.get((s or "pending").lower(), s)
+
+def _ipn_url() -> str:
+    base = PUBLIC_BASE_URL
+    if not base:
+        host = DOMAINS[0] if DOMAINS else "localhost"
+        scheme = "http" if host in ("localhost", "127.0.0.1") else "https"
+        base = f"{scheme}://{host}"
+    return base + "/api/payments/webhook/nowpayments"
+
+def settle_deposit(conn, d, actor: str = "system") -> bool:
+    """Idempotently mark a pending deposit as paid and release its order/credit.
+
+    Safe to call from a webhook, a status poll, or an admin action at the same
+    time: the state transition is guarded by ``status='pending'``.
+    """
+    cur = conn.execute("UPDATE deposits SET status='approved', settled_at=?, updated_at=? "
+                       "WHERE id=? AND status='pending'", (now(), now(), d["id"]))
+    if cur.rowcount != 1:
+        return False
+    oid = _linked_order_id(d["reference"] or "")
+    if oid:
+        # Products were already reserved at checkout; completing releases them.
+        conn.execute("UPDATE orders SET status='completed' "
+                     "WHERE id=? AND status IN ('pending_payment','pending','unpaid')", (oid,))
+    else:
+        conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
+    audit("deposit_settle", actor, f"id={d['id']} amount={d['amount']} ref={d['reference']}")
+    return True
+
+def _provider_payment(conn, ref: str, cents: int, coin: str, user, purpose: str) -> Optional[dict]:
+    """Create a NOWPayments invoice for a pending deposit row and persist its data."""
+    if not (npp and npp.enabled()):
+        return None
+    email = user.get("email") if isinstance(user, dict) else "-"
+    try:
+        info = npp.create_payment(cents / 100.0, "usd", coin, ref,
+                                  f"{SITE} {purpose}", _ipn_url())
+    except Exception as e:
+        audit("crypto_provider_error", email or "-", f"{ref}: {e}")
+        return None
+    conn.execute(
+        "UPDATE deposits SET provider='nowpayments', provider_id=?, pay_currency=?, pay_amount=?, "
+        "pay_address=?, payin_extra_id=?, checkout_url=?, meta=?, updated_at=? WHERE reference=?",
+        (str(info.get("payment_id") or ""), (info.get("pay_currency") or coin).upper(),
+         str(info.get("pay_amount") or ""), info.get("pay_address"), info.get("payin_extra_id"),
+         info.get("invoice_url") or info.get("checkout_url"), json.dumps(info), now(), ref))
+    return info
+
+def _apply_provider_status(conn, d, np_status: str, info: Optional[dict] = None) -> str:
+    """Persist a provider status and settle / fail the deposit accordingly."""
+    fields = {"updated_at": now()}
+    if info:
+        if info.get("pay_address"):
+            fields["pay_address"] = info["pay_address"]
+        if info.get("pay_amount") is not None:
+            fields["pay_amount"] = str(info["pay_amount"])
+        if info.get("payin_extra_id"):
+            fields["payin_extra_id"] = info["payin_extra_id"]
+        if info.get("pay_currency"):
+            fields["pay_currency"] = str(info["pay_currency"]).upper()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    conn.execute(f"UPDATE deposits SET {sets} WHERE id=?", tuple(fields.values()) + (d["id"],))
+    mapped = npp.map_status(np_status) if npp else "pending"
+    if mapped == "completed":
+        settle_deposit(conn, d, actor="nowpayments")
+        return "completed"
+    if mapped == "failed":
+        oid = _linked_order_id(d["reference"] or "")
+        if oid:
+            conn.execute("UPDATE stock_items SET sold=0, order_id=NULL WHERE order_id=?", (oid,))
+            conn.execute("UPDATE orders SET status='cancelled' "
+                         "WHERE id=? AND status IN ('pending_payment','pending','unpaid')", (oid,))
+        conn.execute("UPDATE deposits SET status='failed' WHERE id=? AND status='pending'", (d["id"],))
+        return "failed"
+    return _client_status(d["status"])
+
+def _refresh_crypto_deposit(conn, d):
+    """Ask the provider for the latest state of a pending, provider-backed deposit."""
+    if not (npp and npp.enabled() and d.get("provider_id")):
+        return d
+    if d["status"] != "pending":
+        return d
+    try:
+        info = npp.get_payment(d["provider_id"])
+    except Exception:
+        return d
+    _apply_provider_status(conn, d, (info.get("payment_status") or "").lower(), info)
+    conn.commit()
+    return conn.execute("SELECT * FROM deposits WHERE id=?", (d["id"],)).fetchone()
 
 def _crypto_tracking(r) -> dict:
     method = (r["method"] or "crypto:BTC").split(":", 1)
     coin = (method[1] if len(method) > 1 else "BTC").upper()
-    conn = db()
-    addr = crypto_address(conn, coin)
-    conn.close()
+    pay_currency = (r.get("pay_currency") or coin).upper()
+    address = r.get("pay_address")
+    if not address:
+        conn = db()
+        address = crypto_address(conn, pay_currency)
+        conn.close()
     cents = int(round(float(r["amount"] or 0)))
     created = int(r["created_at"] or now())
+    pay_amount = r.get("pay_amount") or f"{cents / 100.0:.2f}"
+    oid = _linked_order_id(r["reference"] or "")
     return {
         "paymentId": r["reference"],
         "reference": r["reference"],
-        "status": r["status"],
-        "payCurrency": coin,
+        "status": _client_status(r["status"]),
+        "payCurrency": pay_currency,
         "currency": "USD",
-        "network": coin,
-        "payAddress": addr,
-        "address": addr,
-        "payAmount": f"{cents / 100.0:.2f}",
+        "network": pay_currency,
+        "payAddress": address,
+        "address": address,
+        "payAmount": str(pay_amount),
         "amount": cents,
+        "payinExtraId": r.get("payin_extra_id"),
+        "checkoutUrl": r.get("checkout_url"),
+        "provider": r.get("provider") or "manual",
+        "orderId": oid if oid else r["reference"],
         "expiresAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created + 3600)),
     }
 
@@ -1044,35 +1224,62 @@ def deposit_crypto(data: CryptoIn, user: dict = Depends(get_current_user)):
         raise ApiError(400, "Invalid amount")
     coin = (data.payCurrency or data.currency or "BTC").upper()
     conn = db()
-    mins = json.loads(get_setting(conn, "min_deposits"))
-    minimum = mins.get("crypto", 10)
-    if usd < minimum:
-        conn.close()
-        raise ApiError(400, f"Minimum deposit is ${minimum}")
+    purpose = (data.purpose or "deposit").lower()
+    if data.orderId:
+        purpose = "order"
+    if purpose != "order":
+        mins = json.loads(get_setting(conn, "min_deposits"))
+        minimum = mins.get("crypto", 10)
+        if usd < minimum:
+            conn.close()
+            raise ApiError(400, f"Minimum deposit is ${minimum}")
     addr = crypto_address(conn, coin)
-    ref = secrets.token_hex(8) if new_dialect else _deposit_ref()
+    if data.orderId:
+        ref = f"ORD{int(data.orderId)}-{secrets.token_hex(3).upper()}"
+    else:
+        ref = secrets.token_hex(8) if new_dialect else _deposit_ref()
     conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
                  (user["id"], f"crypto:{coin}", cents, ref, "pending", now()))
     conn.commit()
-    tg_notify(f"[{SITE}] Crypto deposit req {ref} by {user['email']}: ${usd}")
+    _provider_payment(conn, ref, cents, coin, user, purpose)
+    conn.commit()
+    tg_notify(f"[{SITE}] Crypto {'order' if purpose == 'order' else 'deposit'} req {ref} by {user['email']}: ${usd}")
     row = conn.execute("SELECT * FROM deposits WHERE reference=?", (ref,)).fetchone()
     conn.close()
     if new_dialect:
         return _crypto_tracking(row)
-    return {"address": addr, "amount": cents, "currency": coin, "reference": ref,
+    return {"address": row.get("pay_address") or addr, "amount": cents, "currency": coin, "reference": ref,
             "status": "pending", "expiresAt": ts(now() + 3600)}
 
 @app.get("/api/payments/crypto/currencies")
 def crypto_currencies():
+    if npp and npp.enabled():
+        cached = _np_currencies_cache.get("value")
+        if cached and _np_currencies_cache.get("expires", 0) > time.time():
+            return {"currencies": cached}
+        try:
+            currencies = npp.get_currencies()
+            if currencies:
+                _np_currencies_cache["value"] = currencies
+                _np_currencies_cache["expires"] = time.time() + 600
+                return {"currencies": currencies}
+        except Exception:
+            pass
     return {"currencies": list(CRYPTO_ADDRESS_KEY.keys())}
+
+_np_currencies_cache: Dict[str, Any] = {}
 
 @app.get("/api/payments/crypto/status")
 def crypto_status(user: dict = Depends(get_current_user)):
     conn = db()
     rows = conn.execute("SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+    out = []
+    for r in rows:
+        r = _refresh_crypto_deposit(conn, r)
+        out.append({"id": r["id"], "method": r["method"], "amount": r["amount"], "reference": r["reference"],
+                    "status": _client_status(r["status"]), "createdAt": ts(r["created_at"])})
     conn.close()
-    return [{"id": r["id"], "method": r["method"], "amount": r["amount"], "reference": r["reference"],
-             "status": r["status"], "createdAt": ts(r["created_at"])} for r in rows]
+    return out
 
 def _find_crypto_deposit(conn, pid: str, user_id: int):
     row = None
@@ -1086,20 +1293,48 @@ def _find_crypto_deposit(conn, pid: str, user_id: int):
 def crypto_payment_detail(pid: str, user: dict = Depends(get_current_user)):
     conn = db()
     r = _find_crypto_deposit(conn, pid, user["id"])
-    conn.close()
     if not r:
+        conn.close()
         raise ApiError(404, "Not found")
+    r = _refresh_crypto_deposit(conn, r)
+    conn.close()
     return _crypto_tracking(r)
 
 @app.get("/api/payments/crypto/{pid}/status")
 def crypto_payment_status(pid: str, user: dict = Depends(get_current_user)):
     conn = db()
     r = _find_crypto_deposit(conn, pid, user["id"])
-    conn.close()
     if not r:
+        conn.close()
         raise ApiError(404, "Not found")
-    return {"status": r["status"], "reference": r["reference"], "amount": r["amount"],
-            "createdAt": ts(r["created_at"])}
+    r = _refresh_crypto_deposit(conn, r)
+    conn.close()
+    oid = _linked_order_id(r["reference"] or "")
+    return {"status": _client_status(r["status"]), "reference": r["reference"], "amount": r["amount"],
+            "orderId": oid if oid else r["reference"], "createdAt": ts(r["created_at"])}
+
+@app.post("/api/payments/webhook/nowpayments")
+async def nowpayments_webhook(request: Request):
+    """IPN callback. Verifies the HMAC signature, then settles idempotently."""
+    raw = await request.body()
+    sig = request.headers.get("x-nowpayments-sig", "")
+    if not (npp and npp.enabled() and npp.verify_ipn(raw, sig)):
+        raise ApiError(401, "Invalid signature")
+    try:
+        data = json.loads(raw.decode() or "{}")
+    except Exception:
+        raise ApiError(400, "Invalid payload")
+    pid = str(data.get("payment_id") or "")
+    status = (data.get("payment_status") or "").lower()
+    conn = db()
+    d = conn.execute("SELECT * FROM deposits WHERE provider_id=?", (pid,)).fetchone() if pid else None
+    if not d:
+        conn.close()
+        return {"ok": True, "ignored": True}
+    _apply_provider_status(conn, d, status, data)
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 @app.get("/api/deposits")
 def my_deposits(user: dict = Depends(get_current_user)):
@@ -1724,21 +1959,11 @@ def approve_deposit(did: int, user: dict = Depends(get_current_user)):
     if not d:
         conn.close()
         raise ApiError(404, "Not found")
-    cur = conn.execute("UPDATE deposits SET status='approved' WHERE id=? AND status='pending'", (did,))
-    if cur.rowcount != 1:
+    if not settle_deposit(conn, d, actor=user["email"]):
         conn.rollback(); conn.close()
         raise ApiError(400, "Not a pending deposit")
-    if d["reference"] and d["reference"].startswith("ORD"):
-        try:
-            oid = int(d["reference"].split("-")[0][3:])
-            conn.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
-        except Exception:
-            conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
-    else:
-        conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
     conn.commit()
     conn.close()
-    audit("deposit_approve", user["email"], f"id={did} amount={d['amount']}")
     return {"ok": True}
 
 @app.post("/api/admin/deposits/{did}/reject")
@@ -2121,15 +2346,21 @@ def order_crypto(data: CryptoOrderIn, user: dict = Depends(get_current_user)):
             oid, total, _ = _cart_order(conn, data.items, user, data.discountCodeId)
         except ApiError:
             conn.rollback(); conn.close(); raise
-        mp = crypto_address(conn, coin)
         ref = f"ORD{oid}-{secrets.token_hex(3).upper()}"
         conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
                      (user["id"], f"crypto:{coin}", total, ref, "pending", now()))
-        conn.commit(); conn.close()
+        conn.commit()
+        _provider_payment(conn, ref, total, coin, user, "order")
+        conn.commit()
+        row = conn.execute("SELECT * FROM deposits WHERE reference=?", (ref,)).fetchone()
+        conn.close()
         tg_notify(f"[{SITE}] CRYPTO ORDER #{oid} pending by {user['email']}: ${total / 100:.2f}")
+        track = _crypto_tracking(row)
         return {"orderId": oid, "id": oid, "reference": ref, "amount": total, "total": total,
-                "currency": coin, "payCurrency": coin, "address": mp, "payAddress": mp,
-                "status": "pending"}
+                "currency": coin, "payCurrency": coin, "address": track["payAddress"],
+                "payAddress": track["payAddress"], "payAmount": track["payAmount"],
+                "checkoutUrl": track.get("checkoutUrl"), "status": "pending",
+                "paymentId": ref}
     if data.quantity < 1:
         raise ApiError(400, "Invalid quantity")
     if not data.variantId or data.variantId <= 0:
@@ -2151,20 +2382,20 @@ def order_crypto(data: CryptoOrderIn, user: dict = Depends(get_current_user)):
                     (user["id"], data.variantId, data.quantity, total, "pending_payment", json.dumps(items), now()))
     for s in stock:
         conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=?", (oid, s["id"]))
-    mp = json.loads(get_setting(conn, "manual_payments"))
-    addr = mp.get("bitcoin", "bc1qph")
-    if data.currency == "ETH":
-        addr = mp.get("ethereum", "0x")
-    elif data.currency == "LTC":
-        addr = mp.get("litecoin", "ltc1q")
     ref = f"ORD{oid}-{secrets.token_hex(3).upper()}"
     conn.execute("INSERT INTO deposits(user_id,method,amount,reference,status,created_at) VALUES(?,?,?,?,?,?)",
-                 (user["id"], f"crypto:{data.currency}", total, ref, "pending", now()))
+                 (user["id"], f"crypto:{coin}", total, ref, "pending", now()))
     conn.commit()
+    _provider_payment(conn, ref, total, coin, user, "order")
+    conn.commit()
+    row = conn.execute("SELECT * FROM deposits WHERE reference=?", (ref,)).fetchone()
     conn.close()
     tg_notify(f"[{SITE}] CRYPTO ORDER #{oid} pending by {user['email']}: ${total}")
-    return {"orderId": oid, "address": addr, "amount": total, "currency": data.currency,
-            "reference": ref, "status": "pending"}
+    track = _crypto_tracking(row)
+    return {"orderId": oid, "id": oid, "reference": ref, "amount": total, "total": total,
+            "currency": coin, "payCurrency": coin, "address": track["payAddress"],
+            "payAddress": track["payAddress"], "payAmount": track["payAmount"],
+            "checkoutUrl": track.get("checkoutUrl"), "status": "pending", "paymentId": ref}
 
 # 3. public variants listing
 @app.get("/api/variants")
@@ -2732,11 +2963,14 @@ def order_live_check(oid: int, user: dict = Depends(get_current_user)):
     if not o:
         conn.close()
         raise ApiError(404, "Not found")
-    d = conn.execute("SELECT status FROM deposits WHERE reference LIKE ? ORDER BY id DESC LIMIT 1",
+    d = conn.execute("SELECT * FROM deposits WHERE reference LIKE ? ORDER BY id DESC LIMIT 1",
                      (f"ORD{oid}-%",)).fetchone()
+    if d and d["status"] == "pending":
+        d = _refresh_crypto_deposit(conn, d)
+    o = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
     conn.close()
     return {"id": o["id"], "status": o["status"], "paid": o["status"] == "completed",
-            "paymentStatus": d["status"] if d else None}
+            "paymentStatus": _client_status(d["status"]) if d else None}
 
 # ---- support ----
 @app.patch("/api/admin/support/{tid}")
