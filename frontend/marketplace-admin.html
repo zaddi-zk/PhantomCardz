@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Marketplace Admin · PhantomCardz</title>
+<style>
+  :root{--bg:#0a0a0b;--panel:#141416;--panel2:#1b1b1f;--line:#26262c;--txt:#e7e7ea;--mut:#9a9aa6;--acc:#7c5cff;--ok:#33d17a;--warn:#ffb020;--bad:#ff5c5c}
+  *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+  a{color:var(--acc)}header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+  header h1{font-size:16px;margin:0}header .sp{flex:1}.tag{font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;color:var(--mut)}
+  main{max-width:1080px;margin:0 auto;padding:20px;display:grid;gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card h2{margin:0 0 12px;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut)}
+  input,select,textarea{background:#0f0f12;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 9px;font:inherit}
+  button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}button.ok{background:var(--ok);color:#04120a}button.bad{background:var(--bad)}
+  table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
+  th{color:var(--mut);font-weight:600}.muted{color:var(--mut)}
+  .pill{padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
+  .pill.pending,.pill.requested{color:var(--warn)}.pill.active,.pill.approved,.pill.paid{color:var(--ok)}.pill.rejected,.pill.suspended{color:var(--bad)}
+  .toast{position:fixed;bottom:18px;right:18px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;opacity:0;transition:.2s;max-width:340px}
+  .toast.show{opacity:1}.hidden{display:none!important}
+</style>
+</head>
+<body>
+<header>
+  <h1>Marketplace Admin</h1><span class="tag" id="who">…</span><span class="sp"></span>
+  <a href="/seller">Seller view</a> &nbsp; <a href="/admin">Admin</a>
+</header>
+<main>
+  <section class="card"><h2>Seller applications</h2><div style="overflow:auto"><table id="apps"><thead><tr><th>User</th><th>Motivation</th><th>Status</th><th>Commission %</th><th></th></tr></thead><tbody></tbody></table></div></section>
+  <section class="card"><h2>Seller accounts</h2><div style="overflow:auto"><table id="sellers"><thead><tr><th>User</th><th>Code</th><th>Status</th><th>Commission %</th><th>Available</th><th>Paid out</th><th></th></tr></thead><tbody></tbody></table></div></section>
+  <section class="card"><h2>Listings review</h2><div id="listings"></div></section>
+  <section class="card"><h2>Payouts</h2><div style="overflow:auto"><table id="payouts"><thead><tr><th>#</th><th>Seller</th><th>Amount</th><th>Method</th><th>Destination</th><th>Status</th><th></th></tr></thead><tbody></tbody></table></div></section>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+const money=c=>"$"+((c||0)/100).toFixed(2);
+let tt;function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>t.classList.remove("show"),3200);}
+async function api(path,opts={}){opts.credentials="include";if(opts.body&&typeof opts.body!=="string"){opts.headers=Object.assign({"Content-Type":"application/json"},opts.headers||{});opts.body=JSON.stringify(opts.body);}const r=await fetch(path,opts);let d={};try{d=await r.json();}catch(e){}if(!r.ok){const e=new Error(d.message||("HTTP "+r.status));e.status=r.status;throw e;}return d;}
+function row(tbody,html){const tr=document.createElement("tr");tr.innerHTML=html;tbody.append(tr);return tr;}
+function btn(label,cls,fn){const b=document.createElement("button");b.textContent=label;if(cls)b.className=cls;b.onclick=fn;return b;}
+async function boot(){
+  let u;try{u=await api("/api/user");}catch(e){if(e.status===401){location.href="/auth";return;}throw e;}
+  if(u.rank!=="admin"){document.body.innerHTML='<p style="padding:40px">Admins only. <a href="/">Home</a></p>';return;}
+  $("#who").textContent=u.email;
+  await refresh();
+}
+async function refresh(){ await loadSellers(); await loadListings(); await loadPayouts(); }
+async function loadSellers(){
+  const d=await api("/api/admin/sellers");
+  const ab=$("#apps tbody");ab.innerHTML="";
+  for(const a of d.applications){
+    const tr=row(ab,`<td>${a.email||a.userId}<div class="muted">${a.telegram||""}</div></td><td style="max-width:320px">${(a.motivation||"").replace(/</g,"&lt;")}</td><td><span class="pill ${a.status}">${a.status}</span></td><td></td><td></td>`);
+    const c=document.createElement("div");c.className="row";const inp=document.createElement("input");inp.type="number";inp.value="15";inp.style.width="70px";
+    const td=tr.lastElementChild;td.style.whiteSpace="nowrap";
+    td.append(inp,btn("Approve","ok",async()=>{try{await api(`/api/admin/sellers/${a.userId}/approve`,{method:"POST",body:{commissionBps:Math.round(parseFloat(inp.value||15)*100)}});toast("Approved");refresh();}catch(e){toast(e.message);}}),
+      btn("Reject","bad",async()=>{try{await api(`/api/admin/sellers/${a.userId}/reject`,{method:"POST",body:{}});toast("Rejected");refresh();}catch(e){toast(e.message);}}));
+  }
+  if(!d.applications.length)ab.innerHTML='<tr><td colspan="5" class="muted">No applications.</td></tr>';
+  const sb=$("#sellers tbody");sb.innerHTML="";
+  for(const s of d.sellers){
+    const tr=row(sb,`<td>${s.email||s.userId}</td><td>${s.sellerCode||""}</td><td><span class="pill ${s.status}">${s.status}</span></td><td></td><td>${money(s.balances.availableCents)}</td><td>${money(s.balances.committedCents)}</td><td style="white-space:nowrap"></td>`);
+    const td=tr.lastElementChild;const inp=document.createElement("input");inp.type="number";inp.value=((s.commissionBps||0)/100).toFixed(2);inp.style.width="70px";
+    td.append(inp,btn("Save","ghost",async()=>{try{await api(`/api/admin/sellers/${s.userId}`,{method:"PATCH",body:{commissionBps:Math.round(parseFloat(inp.value||0)*100)}});toast("Saved");}catch(e){toast(e.message);}}),
+      btn("Suspend","bad",async()=>{try{await api(`/api/admin/sellers/${s.userId}/suspend`,{method:"POST",body:{}});toast("Suspended");refresh();}catch(e){toast(e.message);}}));
+  }
+  if(!d.sellers.length)sb.innerHTML='<tr><td colspan="7" class="muted">No sellers yet.</td></tr>';
+}
+async function loadListings(){
+  const d=await api("/api/admin/listings");const box=$("#listings");box.innerHTML="";
+  const pending=d.products.filter(p=>p.status!=="active");
+  const mkTable=(items,pendingMode)=>{
+    const t=document.createElement("table");t.innerHTML="<thead><tr><th>Product</th><th>Owner</th><th>Status</th><th>Variants</th><th></th></tr></thead>";const b=document.createElement("tbody");
+    for(const p of items){const tr=row(b,`<td>${p.name} <span class="muted">#${p.id}</span></td><td class="muted">${p.ownerEmail||("owner "+p.ownerId)}</td><td><span class="pill ${p.status}">${p.status}</span></td><td>${p.variants.map(v=>v.name+" ("+v.stockCount+")").join(", ")||"—"}</td><td style="white-space:nowrap"></td>`);
+      const td=tr.lastElementChild;
+      if(pendingMode){td.append(btn("Approve","ok",()=>review(p.id,"active")),btn("Reject","bad",()=>review(p.id,"rejected")));}
+      else{td.append(btn("Unlist","ghost",()=>review(p.id,"pending")));}
+    }
+    t.append(b);return t;
+  };
+  if(pending.length){const h=document.createElement("p");h.className="muted";h.textContent="Awaiting review";box.append(h,mkTable(pending,true));}
+  const h2=document.createElement("p");h2.className="muted";h2.textContent="All listings";box.append(h2,mkTable(d.products,false));
+  const cb=document.createElement("p");cb.className="muted";cb.innerHTML=`Card bases: ${d.cardBases.length} · stock ${d.cardBases.reduce((a,x)=>a+x.stockCount,0)}`;box.append(cb);
+  async function review(id,status){try{await api(`/api/admin/products/${id}/review`,{method:"PATCH",body:{status}});toast("Set "+status);refresh();}catch(e){toast(e.message);}}
+}
+async function loadPayouts(){
+  const rows=await api("/api/admin/payouts");const tb=$("#payouts tbody");tb.innerHTML="";
+  for(const p of rows){const tr=row(tb,`<td>#${p.id}</td><td>${p.email||p.sellerId}</td><td>${money(p.amountCents)}</td><td>${p.method||""}</td><td>${p.destination||""}</td><td><span class="pill ${p.status}">${p.status}</span></td><td style="white-space:nowrap"></td>`);
+    const td=tr.lastElementChild;
+    if(p.status==="requested")td.append(btn("Approve","ghost",()=>act(p.id,"approve")));
+    if(p.status==="requested"||p.status==="approved")td.append(btn("Mark paid","ok",()=>act(p.id,"pay")),btn("Reject","bad",()=>act(p.id,"reject")));
+  }
+  if(!rows.length)tb.innerHTML='<tr><td colspan="7" class="muted">No payouts.</td></tr>';
+  async function act(id,a){try{await api(`/api/admin/payouts/${id}/${a}`,{method:"POST",body:{}});toast("Payout "+a);refresh();}catch(e){toast(e.message);}}
+}
+boot().catch(e=>toast(e.message));
+</script>
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Seller Dashboard · PhantomCardz</title>
+<style>
+  :root{--bg:#0a0a0b;--panel:#141416;--panel2:#1b1b1f;--line:#26262c;--txt:#e7e7ea;--mut:#9a9aa6;--acc:#7c5cff;--ok:#33d17a;--warn:#ffb020;--bad:#ff5c5c}
+  *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+  a{color:var(--acc)}header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+  header h1{font-size:16px;margin:0}header .sp{flex:1}.tag{font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;color:var(--mut)}
+  main{max-width:1080px;margin:0 auto;padding:20px;display:grid;gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card h2{margin:0 0 12px;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+  .stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px}
+  .stat b{display:block;font-size:20px}.stat span{color:var(--mut);font-size:12px}
+  label{display:block;color:var(--mut);font-size:12px;margin:8px 0 4px}
+  input,select,textarea{width:100%;background:#0f0f12;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:9px 10px;font:inherit}
+  textarea{min-height:90px;font-family:ui-monospace,Menlo,monospace}
+  button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:9px 14px;font:inherit;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
+  button.bad{background:var(--bad)}button.ok{background:var(--ok);color:#04120a}
+  button:disabled{opacity:.5;cursor:default}
+  table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line)}
+  th{color:var(--mut);font-weight:600}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:end}.row>*{flex:1;min-width:120px}
+  .muted{color:var(--mut)}.pill{padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
+  .pill.pending{color:var(--warn)}.pill.active,.pill.approved,.pill.paid{color:var(--ok)}.pill.rejected,.pill.suspended{color:var(--bad)}
+  .toast{position:fixed;bottom:18px;right:18px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;opacity:0;transition:.2s;max-width:340px}
+  .toast.show{opacity:1}.hidden{display:none!important}
+</style>
+</head>
+<body>
+<header>
+  <h1>Seller Dashboard</h1>
+  <span class="tag" id="who">…</span>
+  <span id="statusTag" class="pill">…</span>
+  <span class="sp"></span>
+  <a href="/">Storefront</a>
+</header>
+<main>
+  <section class="card hidden" id="applyCard">
+    <h2>Become a seller</h2>
+    <p class="muted">Apply to list your products and get paid automatically on every sale.</p>
+    <label>Why should we approve you?</label>
+    <textarea id="applyNote" placeholder="What do you sell? Track record, vouches, etc."></textarea>
+    <div style="margin-top:10px"><button id="applyBtn">Submit application</button></div>
+  </section>
+
+  <section class="card hidden" id="dash">
+    <h2>Earnings</h2>
+    <div class="grid">
+      <div class="stat"><b id="bPending">—</b><span>Pending (escrow)</span></div>
+      <div class="stat"><b id="bAvail">—</b><span>Available</span></div>
+      <div class="stat"><b id="bWith">—</b><span>Withdrawable</span></div>
+      <div class="stat"><b id="bGross">—</b><span>Gross sales</span></div>
+      <div class="stat"><b id="bFee">—</b><span>Platform fees</span></div>
+      <div class="stat"><b id="bComm">—</b><span>Commission</span></div>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <div><label>Payout amount ($)</label><input id="poAmt" type="number" step="0.01" min="0" placeholder="0.00" /></div>
+      <div><label>Method</label><input id="poMethod" placeholder="cashapp / crypto" /></div>
+      <div><label>Destination</label><input id="poDest" placeholder="tag / wallet" /></div>
+      <div style="flex:0"><button id="poBtn">Request payout</button></div>
+    </div>
+  </section>
+
+  <section class="card hidden" id="listingsCard">
+    <h2>Listings</h2>
+    <div class="row">
+      <div><label>New product name</label><input id="npName" placeholder="e.g. Premium Logs" /></div>
+      <div><label>Description</label><input id="npDesc" placeholder="optional" /></div>
+      <div style="flex:0"><button id="npBtn">Create</button></div>
+    </div>
+    <div id="products" style="margin-top:14px"></div>
+  </section>
+
+  <section class="card hidden" id="basesCard">
+    <h2>Card bases</h2>
+    <div class="row">
+      <div><label>New base name</label><input id="nbName" /></div>
+      <div><label>Price per card ($, optional)</label><input id="nbPrice" type="number" step="0.01" min="0" /></div>
+      <div style="flex:0"><button id="nbBtn">Create base</button></div>
+    </div>
+    <div id="bases" style="margin-top:14px"></div>
+  </section>
+
+  <section class="card hidden" id="salesCard">
+    <h2>Sales</h2>
+    <div style="overflow:auto"><table id="sales"><thead><tr><th>Order</th><th>Item</th><th>Buyer</th><th>Gross</th><th>Fee</th><th>Net</th><th>Status</th><th>Available</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="card hidden" id="payoutsCard">
+    <h2>Payout requests</h2>
+    <div style="overflow:auto"><table id="payouts"><thead><tr><th>#</th><th>Amount</th><th>Method</th><th>Destination</th><th>Status</th><th>Created</th></tr></thead><tbody></tbody></table></div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+const money = c => "$" + ((c||0)/100).toFixed(2);
+let toastT;
+function toast(m){ const t=$("#toast"); t.textContent=m; t.classList.add("show"); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("show"),3200); }
+async function api(path, opts={}){
+  opts.credentials = "include";
+  if (opts.body && typeof opts.body !== "string"){ opts.headers = Object.assign({"Content-Type":"application/json"}, opts.headers||{}); opts.body = JSON.stringify(opts.body); }
+  const r = await fetch(path, opts);
+  let d = {}; try { d = await r.json(); } catch(e){}
+  if (!r.ok){ const e = new Error(d.message || ("HTTP " + r.status)); e.code = d.code; e.status = r.status; throw e; }
+  return d;
+}
+async function boot(){
+  let u;
+  try { u = await api("/api/user"); } catch(e){ if (e.status===401){ location.href="/auth"; return; } throw e; }
+  $("#who").textContent = u.email + (u.rank ? " · " + u.rank : "");
+  const me = await api("/api/seller/me");
+  const st = me.status || "none";
+  const tag = $("#statusTag"); tag.textContent = st; tag.className = "pill " + st;
+  if (u.rank === "admin" || st === "approved" || u.rank === "worker"){
+    ["dash","listingsCard","basesCard","salesCard","payoutsCard"].forEach(id=>$("#"+id).classList.remove("hidden"));
+    await refresh();
+  } else {
+    $("#applyCard").classList.remove("hidden");
+  }
+}
+async function refresh(){
+  const e = await api("/api/seller/earnings");
+  $("#bPending").textContent=money(e.pendingCents); $("#bAvail").textContent=money(e.availableCents);
+  $("#bWith").textContent=money(e.withdrawableCents); $("#bGross").textContent=money(e.grossCents);
+  $("#bFee").textContent=money(e.feeCents); $("#bComm").textContent=((e.commissionBps||0)/100).toFixed(2)+"%";
+  renderProducts(await api("/api/seller/products"));
+  renderBases(await api("/api/seller/card-bases"));
+  renderSales(await api("/api/seller/sales"));
+  renderPayouts(await api("/api/seller/payouts"));
+}
+function el(tag,attrs,...kids){const n=document.createElement(tag);for(const k in (attrs||{})){if(k==="onclick")n.onclick=attrs[k];else if(k==="class")n.className=attrs[k];else if(k==="html")n.innerHTML=attrs[k];else n.setAttribute(k,attrs[k]);}for(const k of kids)n.append(k);return n;}
+function renderProducts(ps){
+  const box=$("#products"); box.innerHTML="";
+  if(!ps.length){ box.innerHTML='<p class="muted">No products yet.</p>'; return; }
+  for(const p of ps){
+    const c=el("div",{class:"card",style:"background:var(--panel2);margin-bottom:10px"});
+    c.append(el("div",{class:"row"}, el("div",{style:"flex:1"}, el("b",{},p.name), el("span",{class:"muted",style:"margin-left:8px"}, " #"+p.id)),
+      el("span",{class:"pill "+p.status,style:"flex:0"},p.status)));
+    const vt=el("table"); vt.innerHTML="<thead><tr><th>Variant</th><th>Price</th><th>Stock</th><th>Sold</th></tr></thead>"; const vb=el("tbody");
+    for(const v of p.variants){ const tr=el("tr"); tr.innerHTML=`<td>${v.name}</td><td>${money(v.price)}</td><td>${v.stockCount}</td><td>${v.soldCount}</td>`; vb.append(tr); }
+    vt.append(vb); c.append(vt);
+    const r=el("div",{class:"row",style:"margin-top:8px"});
+    const vi=el("input",{placeholder:"Variant name"}); const vp=el("input",{placeholder:"Price $",type:"number",step:"0.01",min:"0"}); const vm=el("input",{placeholder:"Min qty",type:"number",min:"1",value:"1"});
+    r.append(vi,vp,vm, el("button",{style:"flex:0",onclick:async()=>{ try{ await api("/api/seller/variants",{method:"POST",body:{productId:p.id,name:vi.value,price:Math.round(parseFloat(vp.value||0)*100),minQuantity:parseInt(vm.value||1)}}); toast("Variant added"); refresh(); }catch(e){toast(e.message);} }}, "Add variant"));
+    c.append(r);
+    if(p.variants.length){
+      const st=el("textarea",{placeholder:"One stock line per row"}); const sv=el("select"); p.variants.forEach(v=>sv.append(el("option",{value:v.id},v.name+" (#"+v.id+")")));
+      const rr=el("div",{class:"row",style:"margin-top:8px"}, sv, el("button",{style:"flex:0",onclick:async()=>{ try{ const d=await api("/api/seller/stock",{method:"POST",body:{variantId:parseInt(sv.value),rawContent:st.value}}); toast("Added "+d.added+" lines"); refresh(); }catch(e){toast(e.message);} }}, "Add stock"));
+      c.append(rr, st);
+    }
+    box.append(c);
+  }
+}
+function renderBases(bs){
+  const box=$("#bases"); box.innerHTML="";
+  if(!bs.length){ box.innerHTML='<p class="muted">No card bases yet.</p>'; return; }
+  for(const b of bs){
+    const c=el("div",{class:"card",style:"background:var(--panel2);margin-bottom:10px"});
+    c.append(el("div",{class:"row"}, el("div",{style:"flex:1"}, el("b",{},b.name), el("span",{class:"muted",style:"margin-left:8px"}," #"+b.id+" · stock "+b.stockCount+" · sold "+b.soldCount))));
+    const pr=el("input",{placeholder:"Price per card $",type:"number",step:"0.01",min:"0"});
+    const ta=el("textarea",{placeholder:"PAN|MM/YY|CVV|city|state|zip  (one per line)"});
+    const rr=el("div",{class:"row",style:"margin-top:8px"}, pr, el("button",{style:"flex:0",onclick:async()=>{ try{ const d=await api("/api/seller/cards",{method:"POST",body:{baseId:b.id,price:pr.value?parseFloat(pr.value):0,extras:ta.value}}); toast("Added "+d.added+" cards"); refresh(); }catch(e){toast(e.message);} }}, "Add cards"));
+    c.append(rr, ta); box.append(c);
+  }
+}
+function renderSales(rows){
+  const tb=$("#sales tbody"); tb.innerHTML="";
+  for(const s of rows){ const tr=el("tr"); tr.innerHTML=`<td>#${s.orderId}</td><td>${s.itemName||("card #"+s.refId)}</td><td>${s.buyer||"—"}</td><td>${money(s.grossCents)}</td><td>${money(s.feeCents)}</td><td>${money(s.netCents)}</td><td><span class="pill ${s.status}">${s.status}</span></td><td class="muted">${s.availableAt||""}</td>`; tb.append(tr); }
+  if(!rows.length) tb.innerHTML='<tr><td colspan="8" class="muted">No sales yet.</td></tr>';
+}
+function renderPayouts(rows){
+  const tb=$("#payouts tbody"); tb.innerHTML="";
+  for(const p of rows){ const tr=el("tr"); tr.innerHTML=`<td>#${p.id}</td><td>${money(p.amountCents)}</td><td>${p.method||""}</td><td>${p.destination||""}</td><td><span class="pill ${p.status}">${p.status}</span></td><td class="muted">${p.createdAt||""}</td>`; tb.append(tr); }
+  if(!rows.length) tb.innerHTML='<tr><td colspan="6" class="muted">No payouts yet.</td></tr>';
+}
+$("#applyBtn").onclick = async () => { try{ await api("/api/seller/apply",{method:"POST",body:{note:$("#applyNote").value}}); toast("Application submitted"); location.reload(); }catch(e){toast(e.message);} };
+$("#npBtn").onclick = async () => { try{ await api("/api/seller/products",{method:"POST",body:{name:$("#npName").value,description:$("#npDesc").value}}); toast("Product created (pending review)"); $("#npName").value=""; $("#npDesc").value=""; refresh(); }catch(e){toast(e.message);} };
+$("#nbBtn").onclick = async () => { try{ await api("/api/seller/card-bases",{method:"POST",body:{name:$("#nbName").value,price:Math.round(parseFloat($("#nbPrice").value||0)*100)}}); toast("Base created"); $("#nbName").value=""; refresh(); }catch(e){toast(e.message);} };
+$("#poBtn").onclick = async () => { try{ await api("/api/seller/payouts",{method:"POST",body:{amount:parseFloat($("#poAmt").value||0),method:$("#poMethod").value,destination:$("#poDest").value}}); toast("Payout requested"); refresh(); }catch(e){toast(e.message);} };
+boot().catch(e=>toast(e.message));
+</script>
+</body>
+</html>

@@ -433,6 +433,40 @@ CREATE TABLE IF NOT EXISTS idempotency(
     response TEXT,
     created_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS sellers(
+    user_id INTEGER PRIMARY KEY,
+    seller_code TEXT UNIQUE,
+    status TEXT DEFAULT 'pending',
+    commission_bps INTEGER DEFAULT 1500,
+    approved_at INTEGER,
+    created_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS seller_ledger(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id INTEGER NOT NULL,
+    order_id INTEGER,
+    item_type TEXT,
+    ref_id INTEGER,
+    quantity INTEGER DEFAULT 1,
+    gross_cents INTEGER DEFAULT 0,
+    fee_cents INTEGER DEFAULT 0,
+    net_cents INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',
+    available_at INTEGER,
+    created_at INTEGER,
+    UNIQUE(order_id, item_type, ref_id)
+);
+CREATE TABLE IF NOT EXISTS payouts(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seller_id INTEGER NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    method TEXT,
+    destination TEXT,
+    status TEXT DEFAULT 'requested',
+    note TEXT,
+    created_at INTEGER,
+    paid_at INTEGER
+);
 """
 
 def luhn_generate(length: int = 16) -> str:
@@ -513,6 +547,28 @@ def ensure_schema(conn):
         conn.execute("ALTER TABLE cards ADD COLUMN price INTEGER")
     if not _has_col(conn, "cards", "refundable"):
         conn.execute("ALTER TABLE cards ADD COLUMN refundable INTEGER")
+    # --- seller marketplace: ownership + cost attribution ---
+    for _col, _ddl in (("seller_id", "INTEGER"), ("cost_cents", "INTEGER")):
+        if not _has_col(conn, "stock_items", _col):
+            conn.execute(f"ALTER TABLE stock_items ADD COLUMN {_col} {_ddl}")
+    for _col, _ddl in (("seller_id", "INTEGER"), ("cost_cents", "INTEGER")):
+        if not _has_col(conn, "cards", _col):
+            conn.execute(f"ALTER TABLE cards ADD COLUMN {_col} {_ddl}")
+    if not _has_col(conn, "card_bases", "owner_id"):
+        conn.execute("ALTER TABLE card_bases ADD COLUMN owner_id INTEGER")
+    # Listing review state. Existing catalog stays live ('active'); seller
+    # submissions default to 'active' too and are flipped to 'pending' by the
+    # scoped seller endpoints so nothing in the legacy flow disappears.
+    if not _has_col(conn, "products", "status"):
+        conn.execute("ALTER TABLE products ADD COLUMN status TEXT DEFAULT 'active'")
+    if not _has_col(conn, "orders", "completed_at"):
+        conn.execute("ALTER TABLE orders ADD COLUMN completed_at INTEGER")
+    # Seller-marketplace indexes must be created after the columns above exist.
+    for _ddl in ("CREATE INDEX IF NOT EXISTS idx_stock_seller ON stock_items(seller_id)",
+                 "CREATE INDEX IF NOT EXISTS idx_cards_seller ON cards(seller_id)",
+                 "CREATE INDEX IF NOT EXISTS idx_ledger_seller ON seller_ledger(seller_id, status)",
+                 "CREATE INDEX IF NOT EXISTS idx_payouts_seller ON payouts(seller_id, status)"):
+        conn.execute(_ddl)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
 MONEY_COLUMNS = [
@@ -874,6 +930,14 @@ def read_root(request: Request):
 def health():
     return {"ok": True, "service": "api"}
 
+@app.get("/seller")
+def seller_dashboard():
+    return FileResponse(os.path.join(FRONTEND, "seller.html"), headers={"Cache-Control": "no-cache"})
+
+@app.get("/admin/marketplace")
+def marketplace_dashboard():
+    return FileResponse(os.path.join(FRONTEND, "marketplace-admin.html"), headers={"Cache-Control": "no-cache"})
+
 @app.get("/api/public-config")
 def public_config():
     return {"siteName": SITE, "telegramChannelUrl": TELEGRAM_CHANNEL_URL}
@@ -889,11 +953,12 @@ def announcements():
 @app.get("/api/products")
 def products():
     conn = db()
-    rows = conn.execute("SELECT * FROM products WHERE active=1 ORDER BY pinned DESC, id DESC").fetchall()
+    rows = conn.execute("SELECT * FROM products WHERE active=1 AND (status IS NULL OR status='active') "
+                        "ORDER BY pinned DESC, id DESC").fetchall()
     vs = conn.execute("""
         SELECT v.*, (SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count
         FROM variants v JOIN products p ON p.id=v.productId
-        WHERE p.active=1 ORDER BY v.id
+        WHERE p.active=1 AND (p.status IS NULL OR p.status='active') ORDER BY v.id
     """).fetchall()
     by_product = {}
     for v in vs:
@@ -1313,6 +1378,7 @@ def place_order(data: OrderIn, request: Request, user: dict = Depends(get_curren
                          (oid, None, 1, charge, json.dumps([c["number"]]), "card", c["id"]))
         conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps(items), oid))
         u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+        _on_order_completed(conn, oid)
         result = {"id": oid, "items": items, "total": total,
                   "newBalance": int(round(u["balance"])), "status": "completed"}
         if idem:
@@ -1599,6 +1665,7 @@ def settle_deposit(conn, d, actor: str = "system") -> bool:
         # Products were already reserved at checkout; completing releases them.
         conn.execute("UPDATE orders SET status='completed' "
                      "WHERE id=? AND status IN ('pending_payment','pending','unpaid')", (oid,))
+        _on_order_completed(conn, oid)
     else:
         conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (d["amount"], d["user_id"]))
     audit("deposit_settle", actor, f"id={d['id']} amount={d['amount']} ref={d['reference']}")
@@ -1979,6 +2046,7 @@ def _buy_card_random(base_id: int, user: dict):
                  (oid, None, 1, charge, json.dumps([c["number"]]), "card", c["id"]))
     conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+    _on_order_completed(conn, oid)
     conn.commit()
     conn.close()
     out = card_out(c, b["name"], b["price"], b["hrPercent"], full=True)
@@ -2387,6 +2455,35 @@ def admin_set_worker(uid: int, payload: Dict[str, Any], user: dict = Depends(get
     who = (r["username"] or r["email"]) if r else str(uid)
     tg_notify(f"[{SITE}] {user['email']} {'granted worker access to' if is_worker else 'removed worker access from'} {who}")
     return {"ok": True, "isWorker": is_worker}
+
+class AdminUserIn(BaseModel):
+    email: str
+    password: str
+    username: Optional[str] = None
+    rank: Optional[str] = None
+    balance: Optional[float] = 0
+
+@app.post("/api/admin/users")
+def admin_create_user(data: AdminUserIn, user: dict = Depends(get_current_user)):
+    """Admin-provisioned account. Returns a session token so no login is needed."""
+    require_admin(user)
+    email = (data.email or "").strip().lower()
+    if "@" not in email or not data.password:
+        raise ApiError(400, "Email and password are required")
+    rank = data.rank if data.rank in ("user", "seller", "worker", "admin") else "user"
+    conn = db()
+    try:
+        username = (data.username or "").strip() or new_username(conn)
+        uid = insert_id(conn, "INSERT INTO users(email,username,password_hash,telegram,balance,rank,created_at) "
+                              "VALUES(?,?,?,?,?,?,?)",
+                        (email, username, h(data.password, email), None, to_cents(data.balance or 0), rank, now()))
+    except INTEGRITY_ERRORS:
+        conn.close()
+        raise ApiError(400, "Email already exists")
+    token = create_token(conn, uid)
+    conn.commit(); conn.close()
+    audit("admin_user_create", user["email"], f"target={uid} {email} rank={rank}")
+    return {"id": uid, "ok": True, "email": email, "rank": rank, "token": token}
 
 @app.post("/api/admin/users/{uid}/set-balance")
 def admin_set_balance(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
@@ -2901,10 +2998,571 @@ def seller_me(user: dict = Depends(get_current_user)):
     conn = db()
     r = conn.execute("SELECT * FROM seller_apps WHERE user_id=?", (user["id"],)).fetchone()
     n = conn.execute("SELECT COUNT(*) FROM products WHERE owner_id=?", (user["id"],)).fetchone()[0]
+    s = conn.execute("SELECT * FROM sellers WHERE user_id=?", (user["id"],)).fetchone()
+    status = (s["status"] if s else None) or (r["status"] if r else "none")
+    bal = _seller_balances(conn, user["id"]) if user.get("rank") in ("seller", "worker", "admin") else None
+    commission = _commission_bps(conn, user["id"]) if s else 1500
+    hold = _payout_hold_seconds(conn) // 3600
     conn.close()
-    if not r:
-        return {"status": "none", "products": n}
-    return {"status": r["status"], "products": n}
+    return {"status": status, "products": n, "rank": user.get("rank"),
+            "commissionBps": commission, "holdHours": hold,
+            "sellerCode": (s["seller_code"] if s else None), "balances": bal}
+
+# ================= SELLER MARKETPLACE (listings / earnings / payouts) =====
+def _require_seller(user: dict):
+    """An approved seller (or staff acting on the marketplace)."""
+    if user.get("rank") not in ("seller", "worker", "admin"):
+        raise ApiError(403, "Approved seller only")
+
+def _commission_bps(conn, seller_id: int) -> int:
+    r = conn.execute("SELECT commission_bps FROM sellers WHERE user_id=?", (seller_id,)).fetchone()
+    if r and r["commission_bps"] is not None:
+        try:
+            return max(0, min(10000, int(r["commission_bps"])))
+        except (TypeError, ValueError):
+            pass
+    return 1500
+
+def _payout_hold_seconds(conn) -> int:
+    try:
+        hrs = float(get_setting(conn, "payout_hold_hours", "72"))
+    except (TypeError, ValueError):
+        hrs = 72
+    return max(0, int(hrs * 3600))
+
+def _ledger_insert(conn, seller_id, oid, item_type, ref_id, gross, completed) -> int:
+    """Insert one pending earning; unique per (order, type, ref) so replays no-op.
+
+    ``available_at`` stores the order's completion time; the escrow hold is
+    applied at read time so an admin changing the hold takes effect at once.
+    """
+    gross = _safe_cents(gross)
+    fee = gross * _commission_bps(conn, seller_id) // 10000
+    net = gross - fee
+    cur = conn.execute(
+        "INSERT INTO seller_ledger(seller_id,order_id,item_type,ref_id,quantity,"
+        "gross_cents,fee_cents,net_cents,status,available_at,created_at) "
+        "VALUES(?,?,?,?,1,?,?,?,?,?,?) ON CONFLICT(order_id,item_type,ref_id) DO NOTHING",
+        (seller_id, oid, item_type, ref_id, gross, fee, net, "pending", completed, now()))
+    return 1 if cur.rowcount else 0
+
+def _accrue_earnings(conn, oid: int) -> int:
+    """Idempotently record pending seller earnings for a completed order.
+
+    Attribution is per physical unit: product/log units via ``stock_items.seller_id``
+    (linked by the order they sold in) and card units via ``cards.seller_id``
+    (linked through the order item's ``card_id``). Store-owned stock (NULL seller)
+    earns nobody. Seller gross is the retail price paid at sale time; a buyer
+    discount is absorbed by the platform, never deducted from the seller.
+    """
+    o = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not o or _order_status(o["status"]) != "fulfilled":
+        return 0
+    completed = int(o["completed_at"] or o["created_at"] or now())
+    if not o["completed_at"]:
+        conn.execute("UPDATE orders SET completed_at=? WHERE id=? AND completed_at IS NULL", (completed, oid))
+    created = 0
+    price_by_variant = {}
+    for oi in conn.execute("SELECT variant_id, price FROM order_items WHERE order_id=?", (oid,)).fetchall():
+        if oi["variant_id"] is not None:
+            price_by_variant[oi["variant_id"]] = _safe_cents(oi["price"])
+    for u in conn.execute("SELECT id, variant_id, seller_id FROM stock_items "
+                          "WHERE order_id=? AND seller_id IS NOT NULL AND sold=1", (oid,)).fetchall():
+        created += _ledger_insert(conn, u["seller_id"], oid, "stock", u["id"],
+                                  price_by_variant.get(u["variant_id"], 0), completed)
+    for oi in conn.execute("SELECT card_id, price FROM order_items WHERE order_id=? AND item_type='card'",
+                           (oid,)).fetchall():
+        if not oi["card_id"]:
+            continue
+        c = conn.execute("SELECT seller_id FROM cards WHERE id=?", (oi["card_id"],)).fetchone()
+        if c and c["seller_id"]:
+            created += _ledger_insert(conn, c["seller_id"], oid, "card", oi["card_id"],
+                                      _safe_cents(oi["price"]), completed)
+    return created
+
+def _reconcile_earnings(conn, limit: int = 1000):
+    """Safety net: accrue any completed order that is missing ledger rows."""
+    for r in conn.execute("SELECT id FROM orders WHERE status IN ('completed','fulfilled') "
+                          "ORDER BY id DESC LIMIT ?", (limit,)).fetchall():
+        _accrue_earnings(conn, r["id"])
+
+def _on_order_completed(conn, oid: int):
+    """Accrue earnings for a just-completed order and notify. Idempotent."""
+    if not _accrue_earnings(conn, oid):
+        return
+    rows = conn.execute("SELECT seller_id, SUM(net_cents) AS net FROM seller_ledger "
+                        "WHERE order_id=? GROUP BY seller_id", (oid,)).fetchall()
+    for r in rows:
+        u = conn.execute("SELECT email FROM users WHERE id=?", (r["seller_id"],)).fetchone()
+        tg_notify(f"[{SITE}] Sale on order #{oid} — seller {u['email'] if u else r['seller_id']} "
+                  f"earned ${_safe_cents(r['net']) / 100:.2f} (pending escrow)")
+
+def _seller_balances(conn, seller_id: int) -> dict:
+    t = now()
+    hold = _payout_hold_seconds(conn)
+    row = conn.execute(
+        "SELECT "
+        "COALESCE(SUM(CASE WHEN status='pending' AND available_at + ?> ? THEN net_cents ELSE 0 END),0) AS pending_c, "
+        "COALESCE(SUM(CASE WHEN status='pending' AND available_at + ?<=? THEN net_cents ELSE 0 END),0) AS avail_c, "
+        "COALESCE(SUM(CASE WHEN status='reversed' THEN net_cents ELSE 0 END),0) AS reversed_c, "
+        "COALESCE(SUM(CASE WHEN status!='reversed' THEN gross_cents ELSE 0 END),0) AS gross_c, "
+        "COALESCE(SUM(CASE WHEN status!='reversed' THEN fee_cents ELSE 0 END),0) AS fee_c "
+        "FROM seller_ledger WHERE seller_id=?", (hold, t, hold, t, seller_id)).fetchone()
+    reserved = _safe_cents(conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) AS s FROM payouts "
+        "WHERE seller_id=? AND status IN ('requested','approved','paid')", (seller_id,)).fetchone()["s"])
+    avail = _safe_cents(row["avail_c"])
+    withdrawable = avail - reserved
+    return {"pendingCents": _safe_cents(row["pending_c"]), "availableCents": avail,
+            "committedCents": reserved, "withdrawableCents": withdrawable if withdrawable > 0 else 0,
+            "grossCents": _safe_cents(row["gross_c"]), "feeCents": _safe_cents(row["fee_c"]),
+            "reversedCents": _safe_cents(row["reversed_c"])}
+
+def _owns_product(conn, pid: int, user: dict):
+    p = conn.execute("SELECT id, owner_id FROM products WHERE id=?", (pid,)).fetchone()
+    if not p:
+        raise ApiError(404, "Product not found")
+    if user.get("rank") != "admin" and int(p["owner_id"] or 0) != int(user["id"]):
+        raise ApiError(403, "Not your listing")
+    return p
+
+def _owns_variant(conn, vid: int, user: dict):
+    v = conn.execute("SELECT v.id, v.productId, p.owner_id FROM variants v "
+                     "JOIN products p ON p.id=v.productId WHERE v.id=?", (vid,)).fetchone()
+    if not v:
+        raise ApiError(404, "Variant not found")
+    if user.get("rank") != "admin" and int(v["owner_id"] or 0) != int(user["id"]):
+        raise ApiError(403, "Not your listing")
+    return v
+
+class SellerProductIn(BaseModel):
+    name: str
+    description: str = ""
+    image: str = "/api/images/1"
+
+@app.post("/api/seller/products")
+def seller_add_product(data: SellerProductIn, user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    name = (data.name or "").strip()
+    if not name:
+        raise ApiError(400, "Product name is required")
+    conn = db()
+    pid = insert_id(conn, "INSERT INTO products(name,description,image,active,pinned,owner_id,status,created_at) "
+                          "VALUES(?,?,?,1,0,?,?,?)",
+                    (name, data.description, data.image, user["id"], "pending", now()))
+    conn.commit(); conn.close()
+    tg_notify(f"[{SITE}] New seller listing '{name}' (id {pid}) by {user['email']} — awaiting review")
+    return {"id": pid, "ok": True, "status": "pending"}
+
+@app.get("/api/seller/products")
+def seller_products(user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    rows = conn.execute("SELECT * FROM products WHERE owner_id=? ORDER BY id DESC", (user["id"],)).fetchall()
+    vs = conn.execute(
+        "SELECT v.*, "
+        "(SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count, "
+        "(SELECT COUNT(*) FROM stock_items s2 WHERE s2.variant_id=v.id AND s2.sold=1) AS sold_count "
+        "FROM variants v JOIN products p ON p.id=v.productId WHERE p.owner_id=? ORDER BY v.id",
+        (user["id"],)).fetchall()
+    by = {}
+    for v in vs:
+        by.setdefault(v["productId"], []).append(
+            {"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
+             "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"],
+             "stockCount": v["stock_count"], "soldCount": v["sold_count"]})
+    out = [{"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
+            "active": bool(r["active"]), "pinned": bool(r["pinned"]), "status": (r["status"] or "active"),
+            "createdAt": ts(r["created_at"]), "variants": by.get(r["id"], [])} for r in rows]
+    conn.close()
+    return out
+
+@app.patch("/api/seller/products/{pid}")
+def seller_patch_product(pid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    _owns_product(conn, pid, user)
+    for f in ("name", "description", "image"):
+        if f in payload:
+            conn.execute(f"UPDATE products SET {f}=? WHERE id=?", (payload[f], pid))
+    if "active" in payload:
+        conn.execute("UPDATE products SET active=? WHERE id=?", (1 if payload["active"] else 0, pid))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+class SellerVariantIn(BaseModel):
+    productId: int
+    name: str
+    price: float
+    minQuantity: int = 1
+
+@app.post("/api/seller/variants")
+def seller_add_variant(data: SellerVariantIn, user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    _owns_product(conn, data.productId, user)
+    vid = insert_id(conn, "INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) "
+                          "VALUES(?,?,?,NULL,?,?)",
+                    (data.productId, data.name, _money(data.price), max(1, int(data.minQuantity or 1)), now()))
+    conn.commit(); conn.close()
+    return {"id": vid, "ok": True}
+
+class SellerStockIn(BaseModel):
+    variantId: int
+    rawContent: str
+
+@app.post("/api/seller/stock")
+def seller_add_stock(data: SellerStockIn, user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    _owns_variant(conn, data.variantId, user)
+    lines = [l.strip() for l in (data.rawContent or "").splitlines() if l.strip()]
+    added = 0
+    for l in lines:
+        conn.execute("INSERT INTO stock_items(variant_id,content,seller_id,created_at) VALUES(?,?,?,?)",
+                     (data.variantId, l, user["id"], now()))
+        added += 1
+    conn.commit(); conn.close()
+    return {"ok": True, "addedCount": added, "added": added}
+
+class SellerBaseIn(BaseModel):
+    name: str
+    price: float = 0
+    refundable: bool = False
+
+@app.post("/api/seller/card-bases")
+def seller_add_base(data: SellerBaseIn, user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    name = (data.name or "").strip()
+    if not name:
+        raise ApiError(400, "Base name is required")
+    conn = db()
+    bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent,owner_id) "
+                          "VALUES(?,?,1,?,80,?)",
+                    (name, _money(data.price), 1 if data.refundable else 0, user["id"]))
+    conn.commit(); conn.close()
+    return {"id": bid, "ok": True}
+
+@app.get("/api/seller/card-bases")
+def seller_bases(user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    rows = conn.execute(
+        "SELECT b.*, "
+        "(SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count, "
+        "(SELECT COUNT(*) FROM cards c2 WHERE c2.base_id=b.id AND c2.sold=1) AS sold_count "
+        "FROM card_bases b WHERE b.owner_id=? ORDER BY b.id DESC", (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "name": r["name"], "price": r["price"], "active": bool(r["active"]),
+             "refundable": bool(r["refundable"]), "stockCount": r["stock_count"],
+             "soldCount": r["sold_count"]} for r in rows]
+
+class SellerCardsIn(BaseModel):
+    baseId: int
+    extras: Optional[str] = None
+    price: Optional[float] = None
+    refundable: Optional[bool] = None
+
+@app.post("/api/seller/cards")
+def seller_add_cards(data: SellerCardsIn, user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    if not data.baseId:
+        raise ApiError(400, "Base is required")
+    conn = db()
+    b = conn.execute("SELECT id, owner_id FROM card_bases WHERE id=?", (data.baseId,)).fetchone()
+    if not b:
+        conn.close()
+        raise ApiError(404, "Base not found")
+    if user.get("rank") != "admin" and int(b["owner_id"] or 0) != int(user["id"]):
+        conn.close()
+        raise ApiError(403, "Not your base")
+    price_cents = _money(data.price, dollars=True) if (data.price is not None and data.price > 0) else None
+    refundable = (1 if data.refundable else 0) if data.refundable is not None else None
+    added = skipped = 0
+    for line in (data.extras or "").splitlines():
+        parsed = _parse_card_line(line)
+        if not parsed:
+            if line.strip():
+                skipped += 1
+            continue
+        conn.execute("INSERT INTO cards(base_id,number,exp_month,exp_year,cvv,extras,price,refundable,seller_id) "
+                     "VALUES(?,?,?,?,?,?,?,?,?)",
+                     (data.baseId, parsed["number"], parsed["month"], parsed["year"],
+                      parsed["cvv"], parsed["extras"], price_cents, refundable, user["id"]))
+        added += 1
+    conn.commit(); conn.close()
+    audit("seller_card_add", user["email"], f"base={data.baseId} added={added} skipped={skipped}")
+    return {"ok": True, "added": added, "addedCount": added, "skipped": skipped, "skippedCount": skipped}
+
+@app.get("/api/seller/sales")
+def seller_sales(user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    _reconcile_earnings(conn)
+    conn.commit()
+    hold = _payout_hold_seconds(conn)
+    rows = conn.execute(
+        "SELECT l.*, o.created_at AS order_created, o.status AS order_status, "
+        "COALESCE(v.name, cb.name) AS item_name, bu.email AS buyer "
+        "FROM seller_ledger l "
+        "LEFT JOIN orders o ON o.id=l.order_id "
+        "LEFT JOIN stock_items s ON (l.item_type='stock' AND s.id=l.ref_id) "
+        "LEFT JOIN variants v ON v.id=s.variant_id "
+        "LEFT JOIN cards ca ON (l.item_type='card' AND ca.id=l.ref_id) "
+        "LEFT JOIN card_bases cb ON cb.id=ca.base_id "
+        "LEFT JOIN users bu ON bu.id=o.user_id "
+        "WHERE l.seller_id=? ORDER BY l.id DESC LIMIT 500", (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "orderId": r["order_id"], "itemType": r["item_type"],
+             "refId": r["ref_id"], "itemName": r["item_name"], "quantity": r["quantity"],
+             "grossCents": r["gross_cents"], "feeCents": r["fee_cents"], "netCents": r["net_cents"],
+             "status": r["status"], "availableAt": ts(int(r["available_at"] or 0) + hold),
+             "createdAt": ts(r["created_at"]), "buyer": r["buyer"], "orderStatus": r["order_status"]}
+            for r in rows]
+
+@app.get("/api/seller/earnings")
+def seller_earnings(user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    _reconcile_earnings(conn)
+    conn.commit()
+    bal = _seller_balances(conn, user["id"])
+    bps = _commission_bps(conn, user["id"])
+    hold = _payout_hold_seconds(conn) // 3600
+    conn.close()
+    return {**bal, "commissionBps": bps, "holdHours": hold}
+
+class PayoutIn(BaseModel):
+    amount: float = 0
+    method: Optional[str] = None
+    destination: Optional[str] = None
+    note: Optional[str] = None
+
+@app.get("/api/seller/payouts")
+def seller_payouts(user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    conn = db()
+    rows = conn.execute("SELECT * FROM payouts WHERE seller_id=? ORDER BY id DESC LIMIT 200",
+                        (user["id"],)).fetchall()
+    conn.close()
+    return [{"id": r["id"], "amountCents": r["amount_cents"], "method": r["method"],
+             "destination": r["destination"], "status": r["status"], "note": r["note"],
+             "createdAt": ts(r["created_at"]), "paidAt": ts(r["paid_at"])} for r in rows]
+
+@app.post("/api/seller/payouts")
+def seller_request_payout(data: PayoutIn, user: dict = Depends(get_current_user)):
+    _require_seller(user)
+    amount = _money(data.amount, dollars=True)
+    if amount <= 0:
+        raise ApiError(400, "Enter a payout amount")
+    conn = db()
+    _reconcile_earnings(conn)
+    bal = _seller_balances(conn, user["id"])
+    if amount > bal["withdrawableCents"]:
+        conn.close()
+        raise ApiError(400, "Amount exceeds your withdrawable balance", "insufficient_balance")
+    pid = insert_id(conn, "INSERT INTO payouts(seller_id,amount_cents,method,destination,status,note,created_at) "
+                          "VALUES(?,?,?,?,?,?,?)",
+                    (user["id"], amount, (data.method or "").strip() or "manual",
+                     (data.destination or "").strip(), "requested",
+                     (data.note or "").strip(), now()))
+    conn.commit(); conn.close()
+    tg_notify(f"[{SITE}] Payout request #{pid}: {user['email']} requested ${amount/100:.2f}")
+    return {"id": pid, "ok": True, "status": "requested"}
+
+# ---- admin: seller review, full listings, payouts ----
+@app.get("/api/admin/sellers")
+def admin_sellers(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    apps = conn.execute(
+        "SELECT a.*, u.email, u.username, u.rank FROM seller_apps a "
+        "LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC").fetchall()
+    accounts = conn.execute(
+        "SELECT s.*, u.email, u.username, u.rank FROM sellers s "
+        "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.id DESC").fetchall() \
+        if _has_col(conn, "sellers", "user_id") else []
+    out_accounts = []
+    for s in accounts:
+        bal = _seller_balances(conn, s["user_id"])
+        out_accounts.append({"userId": s["user_id"], "email": s["email"], "username": s["username"],
+                             "sellerCode": s["seller_code"], "status": s["status"],
+                             "commissionBps": s["commission_bps"], "rank": s["rank"],
+                             "approvedAt": ts(s["approved_at"]), "balances": bal})
+    conn.close()
+    return {"applications": [{"userId": a["user_id"], "email": a["email"], "username": a["username"],
+                              "telegram": a["telegram"], "motivation": a["motivation"],
+                              "status": a["status"], "createdAt": ts(a["created_at"])} for a in apps],
+            "sellers": out_accounts}
+
+class SellerDecisionIn(BaseModel):
+    commissionBps: Optional[int] = None
+    note: Optional[str] = None
+
+@app.post("/api/admin/sellers/{uid}/approve")
+def admin_approve_seller(uid: int, data: Optional[SellerDecisionIn] = None, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    u = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        conn.close()
+        raise ApiError(404, "User not found")
+    bps = 1500
+    if data and data.commissionBps is not None:
+        try:
+            bps = max(0, min(10000, int(data.commissionBps)))
+        except (TypeError, ValueError):
+            bps = 1500
+    code = "SLL-" + secrets.token_hex(3).upper()
+    conn.execute("INSERT INTO sellers(user_id,seller_code,status,commission_bps,approved_at,created_at) "
+                 "VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET status='approved', "
+                 "commission_bps=excluded.commission_bps, approved_at=excluded.approved_at",
+                 (uid, code, "approved", bps, now(), now()))
+    conn.execute("UPDATE seller_apps SET status='approved' WHERE user_id=?", (uid,))
+    conn.execute("UPDATE users SET rank='seller' WHERE id=? AND rank NOT IN ('admin','worker')", (uid,))
+    conn.commit(); conn.close()
+    audit("seller_approve", user["email"], f"uid={uid} bps={bps}")
+    tg_notify(f"[{SITE}] Seller approved: {u['email']} ({bps/100:.0f}% commission)")
+    return {"ok": True, "status": "approved", "commissionBps": bps, "sellerCode": code}
+
+@app.post("/api/admin/sellers/{uid}/reject")
+def admin_reject_seller(uid: int, data: Optional[SellerDecisionIn] = None, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("UPDATE seller_apps SET status='rejected' WHERE user_id=?", (uid,))
+    conn.execute("UPDATE sellers SET status='rejected' WHERE user_id=?", (uid,))
+    conn.commit(); conn.close()
+    audit("seller_reject", user["email"], f"uid={uid}")
+    return {"ok": True, "status": "rejected"}
+
+@app.post("/api/admin/sellers/{uid}/suspend")
+def admin_suspend_seller(uid: int, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    conn.execute("UPDATE sellers SET status='suspended' WHERE user_id=?", (uid,))
+    conn.execute("UPDATE users SET rank='user' WHERE id=? AND rank='seller'", (uid,))
+    conn.execute("UPDATE products SET active=0 WHERE owner_id=?", (uid,))
+    conn.commit(); conn.close()
+    audit("seller_suspend", user["email"], f"uid={uid}")
+    return {"ok": True, "status": "suspended"}
+
+@app.patch("/api/admin/sellers/{uid}")
+def admin_patch_seller(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    if "commissionBps" in payload:
+        try:
+            bps = max(0, min(10000, int(payload["commissionBps"])))
+        except (TypeError, ValueError):
+            conn.close()
+            raise ApiError(400, "Invalid commission")
+        conn.execute("UPDATE sellers SET commission_bps=? WHERE user_id=?", (bps, uid))
+    conn.commit(); conn.close()
+    return {"ok": True}
+
+@app.get("/api/admin/listings")
+def admin_listings(user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    rows = conn.execute(
+        "SELECT p.*, u.email AS owner_email, u.username AS owner_username FROM products p "
+        "LEFT JOIN users u ON u.id=p.owner_id ORDER BY p.id DESC").fetchall()
+    vs = conn.execute(
+        "SELECT v.*, "
+        "(SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count, "
+        "(SELECT COUNT(*) FROM stock_items s2 WHERE s2.variant_id=v.id AND s2.sold=1) AS sold_count "
+        "FROM variants v ORDER BY v.id").fetchall()
+    by = {}
+    for v in vs:
+        by.setdefault(v["productId"], []).append(
+            {"id": v["id"], "name": v["name"], "price": v["price"], "minQuantity": v["minQuantity"],
+             "stockCount": v["stock_count"], "soldCount": v["sold_count"]})
+    out = [{"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
+            "active": bool(r["active"]), "pinned": bool(r["pinned"]), "status": (r["status"] or "active"),
+            "ownerId": r["owner_id"], "ownerEmail": r["owner_email"], "ownerUsername": r["owner_username"],
+            "createdAt": ts(r["created_at"]), "variants": by.get(r["id"], [])} for r in rows]
+    bases = conn.execute(
+        "SELECT b.*, u.email AS owner_email, "
+        "(SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count "
+        "FROM card_bases b LEFT JOIN users u ON u.id=b.owner_id ORDER BY b.id DESC").fetchall()
+    conn.close()
+    return {"products": out,
+            "cardBases": [{"id": b["id"], "name": b["name"], "price": b["price"],
+                           "active": bool(b["active"]), "refundable": bool(b["refundable"]),
+                           "ownerId": b["owner_id"], "ownerEmail": b["owner_email"],
+                           "stockCount": b["stock_count"]} for b in bases]}
+
+class ListingDecisionIn(BaseModel):
+    status: Optional[str] = None
+    active: Optional[bool] = None
+
+@app.patch("/api/admin/products/{pid}/review")
+def admin_review_product(pid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
+    require_admin(user)
+    status = (payload.get("status") or "").strip().lower()
+    if status not in ("active", "pending", "rejected", "draft"):
+        raise ApiError(400, "Invalid status")
+    conn = db()
+    conn.execute("UPDATE products SET status=? WHERE id=?", (status, pid))
+    conn.commit(); conn.close()
+    audit("listing_review", user["email"], f"pid={pid} status={status}")
+    return {"ok": True, "status": status}
+
+@app.get("/api/admin/payouts")
+def admin_payouts(status: Optional[str] = None, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    conn = db()
+    q = "SELECT p.*, u.email FROM payouts p LEFT JOIN users u ON u.id=p.seller_id"
+    params = ()
+    if status:
+        q += " WHERE p.status=?"
+        params = (status,)
+    q += " ORDER BY p.id DESC LIMIT 500"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [{"id": r["id"], "sellerId": r["seller_id"], "email": r["email"],
+             "amountCents": r["amount_cents"], "method": r["method"], "destination": r["destination"],
+             "status": r["status"], "note": r["note"], "createdAt": ts(r["created_at"]),
+             "paidAt": ts(r["paid_at"])} for r in rows]
+
+@app.post("/api/admin/payouts/{pid}/{action}")
+def admin_payout_action(pid: int, action: str, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    if action not in ("approve", "pay", "reject"):
+        raise ApiError(400, "Invalid action")
+    conn = db()
+    p = conn.execute("SELECT * FROM payouts WHERE id=?", (pid,)).fetchone()
+    if not p:
+        conn.close()
+        raise ApiError(404, "Payout not found")
+    if action == "approve":
+        conn.execute("UPDATE payouts SET status='approved' WHERE id=? AND status='requested'", (pid,))
+    elif action == "pay":
+        conn.execute("UPDATE payouts SET status='paid', paid_at=? WHERE id=? AND status IN ('requested','approved')",
+                     (now(), pid))
+    else:
+        # rejecting frees the reserved funds back to the seller's available balance
+        conn.execute("UPDATE payouts SET status='rejected' WHERE id=? AND status IN ('requested','approved')", (pid,))
+    conn.commit(); conn.close()
+    audit(f"payout_{action}", user["email"], f"pid={pid}")
+    return {"ok": True, "status": {"approve": "approved", "pay": "paid", "reject": "rejected"}[action]}
+
+class HoldIn(BaseModel):
+    hours: float = 72
+
+@app.post("/api/admin/settings/payout-hold")
+def admin_set_payout_hold(data: HoldIn, user: dict = Depends(get_current_user)):
+    require_admin(user)
+    try:
+        hrs = max(0.0, float(data.hours))
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid hours")
+    conn = db()
+    set_setting(conn, "payout_hold_hours", str(hrs))
+    conn.commit(); conn.close()
+    audit("payout_hold_set", user["email"], f"hours={hrs}")
+    return {"ok": True, "hours": hrs}
+
 
 @app.post("/api/vouches/create-token")
 def vouch_token(payload: Optional[Dict[str, Any]] = None, user: dict = Depends(get_current_user)):
@@ -4122,6 +4780,7 @@ def purchase_card(cid: int, request: Request, data: Optional[PurchaseCardIn] = N
                      (oid, None, 1, charge, json.dumps([c["number"]]), "card", cid))
         conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
         u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+        _on_order_completed(conn, oid)
         out = card_out(c, c["base_name"], c["base_price"], c["base_hr"], full=True)
         out["newBalance"] = int(round(u["balance"]))
         if idem:
@@ -4221,6 +4880,7 @@ def admin_order_deliver(oid: int, payload: Dict[str, Any], user: dict = Depends(
         conn.execute("UPDATE orders SET items=?, status='completed' WHERE id=?", (json.dumps(items), oid))
     else:
         conn.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+    _on_order_completed(conn, oid)
     conn.commit(); conn.close()
     audit("order_deliver", user["email"], f"id={oid}")
     return {"ok": True, "status": "fulfilled"}
@@ -4230,6 +4890,7 @@ def admin_order_cashapp_fulfill(oid: int, payload: Dict[str, Any], user: dict = 
     require_admin(user)
     conn = db(); _admin_order(conn, oid)
     conn.execute("UPDATE orders SET status='completed' WHERE id=?", (oid,))
+    _on_order_completed(conn, oid)
     conn.commit(); conn.close()
     audit("order_cashapp_fulfill", user["email"], f"id={oid}")
     return {"ok": True, "status": "completed"}
@@ -4261,6 +4922,8 @@ def admin_order_refund(oid: int, payload: Dict[str, Any], user: dict = Depends(g
         conn.execute("UPDATE stock_items SET sold=0, order_id=NULL WHERE order_id=?", (oid,))
     if refund > 0:
         conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (refund, o["user_id"]))
+    # A refunded sale is not a sale: reverse any not-yet-paid seller earnings.
+    conn.execute("UPDATE seller_ledger SET status='reversed' WHERE order_id=? AND status='pending'", (oid,))
     conn.execute("UPDATE orders SET status='refunded' WHERE id=?", (oid,))
     conn.commit(); conn.close()
     audit("order_refund", user["email"], f"id={oid} amount={refund}")
@@ -4300,6 +4963,10 @@ def admin_order_replace(oid: int, payload: Dict[str, Any], user: dict = Depends(
             conn.execute("UPDATE stock_items SET sold=1, order_id=? WHERE id=?", (oid, s["id"]))
             contents.append(s["content"])
     conn.execute("UPDATE orders SET items=?, status='completed' WHERE id=?", (json.dumps(contents), oid))
+    # Re-delivery ships the seller's *new* units: reverse the old pending
+    # earnings for this order, then re-accrue against the freshly claimed stock.
+    conn.execute("UPDATE seller_ledger SET status='reversed' WHERE order_id=? AND status='pending'", (oid,))
+    _on_order_completed(conn, oid)
     conn.commit(); conn.close()
     audit("order_replace", user["email"], f"id={oid}")
     return {"ok": True, "status": "completed", "items": contents}
