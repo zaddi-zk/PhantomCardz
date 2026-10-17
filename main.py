@@ -2252,6 +2252,54 @@ def admin_set_balance_alias(uid: int, payload: Dict[str, Any], user: dict = Depe
     conn.commit(); audit("user_set_balance", user["email"], f"target={uid} balance={balance}"); conn.close()
     return {"ok": True, "balance": balance}
 
+class CreditIn(BaseModel):
+    amount: Optional[float] = None          # dollars, e.g. 12.50
+    amountCents: Optional[float] = None     # already in cents
+    method: str = "admin"                   # label shown in the ledger (cashapp, crypto, admin, ...)
+    note: str = ""
+    reference: Optional[str] = None         # supply to make the credit idempotent
+
+@app.post("/api/admin/users/{uid}/credit")
+def admin_credit_user(uid: int, data: CreditIn, user: dict = Depends(get_current_user)):
+    """Add funds to a user's wallet and record it as an approved deposit.
+
+    This is the manual counterpart to a NOWPayments settlement: when a customer
+    pays off-platform (CashApp, bank, crypto sent by hand, ...) an admin credits
+    the exact amount here. Every credit is written to the ``deposits`` ledger so
+    the money is traceable from both the admin Deposits tab and the user's own
+    deposit history. Pass ``reference`` to make the operation idempotent.
+    """
+    require_admin(user)
+    if data.amountCents is not None:
+        try:
+            cents = int(round(float(data.amountCents)))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Invalid amount")
+    elif data.amount is not None:
+        try:
+            cents = to_cents(data.amount)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Invalid amount")
+    else:
+        raise ApiError(400, "Amount is required")
+    if cents == 0:
+        raise ApiError(400, "Amount must not be zero")
+    conn = db(); _admin_target(conn, uid)
+    ref = (data.reference or "").strip() or f"ADM-{secrets.token_hex(4).upper()}"
+    if data.reference:
+        dup = conn.execute("SELECT id FROM deposits WHERE reference=? AND status='approved'", (ref,)).fetchone()
+        if dup:
+            conn.close()
+            raise ApiError(409, "Reference already credited")
+    did = insert_id(conn, "INSERT INTO deposits(user_id,method,amount,reference,status,payin_extra_id,settled_at,created_at) "
+                          "VALUES(?,?,?,?,?,?,?,?)",
+                    (uid, (data.method or "admin"), cents, ref, "approved", (data.note or ""), now(), now()))
+    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (cents, uid))
+    r = conn.execute("SELECT balance FROM users WHERE id=?", (uid,)).fetchone()
+    conn.commit(); conn.close()
+    audit("user_credit", user["email"], f"target={uid} cents={cents} ref={ref}")
+    return {"ok": True, "balance": r["balance"], "amount": cents, "reference": ref, "depositId": did}
+
 @app.post("/api/admin/users/{uid}/password")
 @app.patch("/api/admin/users/{uid}/password")
 def admin_set_password(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
