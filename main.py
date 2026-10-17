@@ -1066,7 +1066,7 @@ def order_items_out(conn, oid: int, fallback_items=None, cache=None) -> list:
         if card_id:
             c = conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
             if c:
-                item["card"] = card_out(c)
+                item["card"] = card_out(c, full=True)
         try:
             item["contents"] = json.loads(oi["contents"] or "[]")
         except Exception:
@@ -1848,21 +1848,27 @@ def bin_data(number: str) -> dict:
     return {"brand": brand, "scheme": brand, "type": "debit", "level": "classic",
             "bank": "Synchrony Bank", "country": "United States", "countryCode": "US"}
 
-def card_out(r, base_name=None, base_price=None, base_hr=None) -> dict:
-    """Serialize a card row in the shape the frozen SPA expects (plus legacy keys)."""
+def card_out(r, base_name=None, base_price=None, base_hr=None, *, full=False) -> dict:
+    """Serialize a card row in the shape the frozen SPA expects (plus legacy keys).
+
+    ``full`` is False for browse/list responses: PAN, CVV and expiry are masked so
+    a buyer can never read unsold inventory (devtools included). Entitled callers
+    -- the owner viewing their own purchased card/order, an admin, or the response
+    to the purchase that just happened -- pass ``full=True``.
+    """
     num = r["number"] or ""
     d = _digits(num)
     mm = int(r["exp_month"] or 0)
     yy = int(r["exp_year"] or 0)
-    masked = (d[:6] + "•" * 6 + d[-4:]) if len(d) >= 10 else num
+    masked = (d[:6] + "•" * 6 + d[-4:]) if len(d) >= 10 else ("•" * len(d))
     _card_price = r.get("price") if hasattr(r, "get") else None
     _card_refund = r.get("refundable") if hasattr(r, "get") else None
     return {
         "id": r["id"],
-        "cardNumber": num,
+        "cardNumber": num if full else masked,
         "maskedCard": masked,
-        "expiry": (f"{mm:02d}/{str(yy)[-2:]}" if mm else ""),
-        "cvv": r["cvv"],
+        "expiry": (f"{mm:02d}/{str(yy)[-2:]}" if (mm and full) else ""),
+        "cvv": r["cvv"] if full else "",
         "country": "US",
         "extras": ((r.get("extras") if hasattr(r, "get") else None) or ""),
         "price": _card_price if _card_price is not None else (base_price if base_price is not None else None),
@@ -1873,9 +1879,9 @@ def card_out(r, base_name=None, base_price=None, base_hr=None) -> dict:
         "baseId": r["base_id"],
         "baseName": base_name,
         "binData": bin_data(num),
-        "number": num,
-        "expMonth": r["exp_month"],
-        "expYear": r["exp_year"],
+        "number": num if full else masked,
+        "expMonth": mm if full else 0,
+        "expYear": yy if full else 0,
         "checked": bool(r["checked"]),
         "valid": r["valid"],
     }
@@ -1975,7 +1981,7 @@ def _buy_card_random(base_id: int, user: dict):
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit()
     conn.close()
-    out = card_out(c, b["name"], b["price"], b["hrPercent"])
+    out = card_out(c, b["name"], b["price"], b["hrPercent"], full=True)
     out["newBalance"] = int(round(u["balance"]))
     return out
 
@@ -2031,7 +2037,7 @@ def my_cards(user: dict = Depends(get_current_user)):
     conn.close()
     out = []
     for r in rows:
-        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"])
+        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"], full=True)
         o["base"] = r["base_name"]
         out.append(o)
     return out
@@ -3724,7 +3730,7 @@ def user_card(cid: int, user: dict = Depends(get_current_user)):
     conn.close()
     if not r:
         raise ApiError(404, "Not found")
-    return card_out(r, r["base_name"], r["base_price"], r["base_hr"])
+    return card_out(r, r["base_name"], r["base_price"], r["base_hr"], full=True)
 
 @app.get("/api/admin/orders")
 def admin_orders(user: dict = Depends(get_current_user)):
@@ -3853,7 +3859,7 @@ def admin_cards(user: dict = Depends(get_current_user)):
     conn.close()
     out = []
     for r in rows:
-        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"])
+        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"], full=True)
         o["base"] = r["base_name"]; o["sold"] = bool(r["sold"]); o["buyer"] = r["buyer"]
         out.append(o)
     return out
@@ -4116,7 +4122,7 @@ def purchase_card(cid: int, request: Request, data: Optional[PurchaseCardIn] = N
                      (oid, None, 1, charge, json.dumps([c["number"]]), "card", cid))
         conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
         u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
-        out = card_out(c, c["base_name"], c["base_price"], c["base_hr"])
+        out = card_out(c, c["base_name"], c["base_price"], c["base_hr"], full=True)
         out["newBalance"] = int(round(u["balance"]))
         if idem:
             _idem_store(conn, idem, user["id"], out)
@@ -4140,7 +4146,7 @@ def admin_base_cards(bid: int, user: dict = Depends(get_current_user)):
     conn.close()
     out = []
     for r in rows:
-        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"])
+        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"], full=True)
         o["sold"] = bool(r["sold"]); o["buyer"] = r["buyer"]
         out.append(o)
     return out
