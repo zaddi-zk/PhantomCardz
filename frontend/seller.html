@@ -98,6 +98,7 @@
 <div class="toast" id="toast"></div>
 <script>
 const $ = s => document.querySelector(s);
+const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const money = c => "$" + ((c||0)/100).toFixed(2);
 let toastT;
 function toast(m){ const t=$("#toast"); t.textContent=m; t.classList.add("show"); clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove("show"),3200); }
@@ -142,7 +143,7 @@ function renderProducts(ps){
     c.append(el("div",{class:"row"}, el("div",{style:"flex:1"}, el("b",{},p.name), el("span",{class:"muted",style:"margin-left:8px"}, " #"+p.id)),
       el("span",{class:"pill "+p.status,style:"flex:0"},p.status)));
     const vt=el("table"); vt.innerHTML="<thead><tr><th>Variant</th><th>Price</th><th>Stock</th><th>Sold</th></tr></thead>"; const vb=el("tbody");
-    for(const v of p.variants){ const tr=el("tr"); tr.innerHTML=`<td>${v.name}</td><td>${money(v.price)}</td><td>${v.stockCount}</td><td>${v.soldCount}</td>`; vb.append(tr); }
+    for(const v of p.variants){ const tr=el("tr"); tr.innerHTML=`<td>${esc(v.name)}</td><td>${money(v.price)}</td><td>${v.stockCount}</td><td>${v.soldCount}</td>`; vb.append(tr); }
     vt.append(vb); c.append(vt);
     const r=el("div",{class:"row",style:"margin-top:8px"});
     const vi=el("input",{placeholder:"Variant name"}); const vp=el("input",{placeholder:"Price $",type:"number",step:"0.01",min:"0"}); const vm=el("input",{placeholder:"Min qty",type:"number",min:"1",value:"1"});
@@ -170,12 +171,12 @@ function renderBases(bs){
 }
 function renderSales(rows){
   const tb=$("#sales tbody"); tb.innerHTML="";
-  for(const s of rows){ const tr=el("tr"); tr.innerHTML=`<td>#${s.orderId}</td><td>${s.itemName||("card #"+s.refId)}</td><td>${s.buyer||"—"}</td><td>${money(s.grossCents)}</td><td>${money(s.feeCents)}</td><td>${money(s.netCents)}</td><td><span class="pill ${s.status}">${s.status}</span></td><td class="muted">${s.availableAt||""}</td>`; tb.append(tr); }
+  for(const s of rows){ const tr=el("tr"); tr.innerHTML=`<td>#${s.orderId}</td><td>${esc(s.itemName||("card #"+s.refId))}</td><td>${esc(s.buyer||"—")}</td><td>${money(s.grossCents)}</td><td>${money(s.feeCents)}</td><td>${money(s.netCents)}</td><td><span class="pill ${esc(s.status)}">${esc(s.status)}</span></td><td class="muted">${esc(s.availableAt||"")}</td>`; tb.append(tr); }
   if(!rows.length) tb.innerHTML='<tr><td colspan="8" class="muted">No sales yet.</td></tr>';
 }
 function renderPayouts(rows){
   const tb=$("#payouts tbody"); tb.innerHTML="";
-  for(const p of rows){ const tr=el("tr"); tr.innerHTML=`<td>#${p.id}</td><td>${money(p.amountCents)}</td><td>${p.method||""}</td><td>${p.destination||""}</td><td><span class="pill ${p.status}">${p.status}</span></td><td class="muted">${p.createdAt||""}</td>`; tb.append(tr); }
+  for(const p of rows){ const tr=el("tr"); tr.innerHTML=`<td>#${p.id}</td><td>${money(p.amountCents)}</td><td>${esc(p.method||"")}</td><td>${esc(p.destination||"")}</td><td><span class="pill ${esc(p.status)}">${esc(p.status)}</span></td><td class="muted">${esc(p.createdAt||"")}</td>`; tb.append(tr); }
   if(!rows.length) tb.innerHTML='<tr><td colspan="6" class="muted">No payouts yet.</td></tr>';
 }
 $("#applyBtn").onclick = async () => { try{ await api("/api/seller/apply",{method:"POST",body:{note:$("#applyNote").value}}); toast("Application submitted"); location.reload(); }catch(e){toast(e.message);} };

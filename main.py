@@ -2918,8 +2918,8 @@ def clear_all(user: dict = Depends(get_current_user), data: Optional[ConfirmIn] 
     if data is not None and data.confirm is not None and data.confirm != "YES":
         raise ApiError(400, "Send confirm=YES")
     conn = db()
-    for t in ["orders", "stock_items", "cards", "deposits", "game_history", "games_mines",
-              "tokens", "password_resets"]:
+    for t in ["orders", "order_items", "stock_items", "cards", "deposits", "game_history", "games_mines",
+              "tokens", "password_resets", "seller_ledger", "payouts"]:
         conn.execute(f"DELETE FROM {t}")
     conn.commit(); audit("clear_all", user["email"]); conn.close()
     return {"ok": True}
@@ -3081,9 +3081,17 @@ def _accrue_earnings(conn, oid: int) -> int:
     return created
 
 def _reconcile_earnings(conn, limit: int = 1000):
-    """Safety net: accrue any completed order that is missing ledger rows."""
-    for r in conn.execute("SELECT id FROM orders WHERE status IN ('completed','fulfilled') "
-                          "ORDER BY id DESC LIMIT ?", (limit,)).fetchall():
+    """Safety net: accrue only the completed orders that still have an un-accrued
+    seller-owned unit (a missed completion hook). Cheap and self-healing."""
+    rows = conn.execute(
+        "SELECT o.id FROM orders o WHERE o.status IN ('completed','fulfilled') AND ("
+        "  EXISTS (SELECT 1 FROM stock_items s WHERE s.order_id=o.id AND s.seller_id IS NOT NULL AND s.sold=1 "
+        "          AND NOT EXISTS (SELECT 1 FROM seller_ledger l WHERE l.order_id=o.id AND l.item_type='stock' AND l.ref_id=s.id)) "
+        "  OR EXISTS (SELECT 1 FROM order_items oi JOIN cards ca ON ca.id=oi.card_id "
+        "             WHERE oi.order_id=o.id AND oi.item_type='card' AND ca.seller_id IS NOT NULL "
+        "             AND NOT EXISTS (SELECT 1 FROM seller_ledger l WHERE l.order_id=o.id AND l.item_type='card' AND l.ref_id=oi.card_id))"
+        ") ORDER BY o.id DESC LIMIT ?", (limit,)).fetchall()
+    for r in rows:
         _accrue_earnings(conn, r["id"])
 
 def _on_order_completed(conn, oid: int):

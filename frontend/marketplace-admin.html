@@ -38,6 +38,7 @@
 <script>
 const $=s=>document.querySelector(s);
 const money=c=>"$"+((c||0)/100).toFixed(2);
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 let tt;function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>t.classList.remove("show"),3200);}
 async function api(path,opts={}){opts.credentials="include";if(opts.body&&typeof opts.body!=="string"){opts.headers=Object.assign({"Content-Type":"application/json"},opts.headers||{});opts.body=JSON.stringify(opts.body);}const r=await fetch(path,opts);let d={};try{d=await r.json();}catch(e){}if(!r.ok){const e=new Error(d.message||("HTTP "+r.status));e.status=r.status;throw e;}return d;}
 function row(tbody,html){const tr=document.createElement("tr");tr.innerHTML=html;tbody.append(tr);return tr;}
@@ -53,7 +54,7 @@ async function loadSellers(){
   const d=await api("/api/admin/sellers");
   const ab=$("#apps tbody");ab.innerHTML="";
   for(const a of d.applications){
-    const tr=row(ab,`<td>${a.email||a.userId}<div class="muted">${a.telegram||""}</div></td><td style="max-width:320px">${(a.motivation||"").replace(/</g,"&lt;")}</td><td><span class="pill ${a.status}">${a.status}</span></td><td></td><td></td>`);
+    const tr=row(ab,`<td>${esc(a.email||a.userId)}<div class="muted">${esc(a.telegram||"")}</div></td><td style="max-width:320px">${esc(a.motivation||"")}</td><td><span class="pill ${esc(a.status)}">${esc(a.status)}</span></td><td></td><td></td>`);
     const c=document.createElement("div");c.className="row";const inp=document.createElement("input");inp.type="number";inp.value="15";inp.style.width="70px";
     const td=tr.lastElementChild;td.style.whiteSpace="nowrap";
     td.append(inp,btn("Approve","ok",async()=>{try{await api(`/api/admin/sellers/${a.userId}/approve`,{method:"POST",body:{commissionBps:Math.round(parseFloat(inp.value||15)*100)}});toast("Approved");refresh();}catch(e){toast(e.message);}}),
@@ -62,7 +63,7 @@ async function loadSellers(){
   if(!d.applications.length)ab.innerHTML='<tr><td colspan="5" class="muted">No applications.</td></tr>';
   const sb=$("#sellers tbody");sb.innerHTML="";
   for(const s of d.sellers){
-    const tr=row(sb,`<td>${s.email||s.userId}</td><td>${s.sellerCode||""}</td><td><span class="pill ${s.status}">${s.status}</span></td><td></td><td>${money(s.balances.availableCents)}</td><td>${money(s.balances.committedCents)}</td><td style="white-space:nowrap"></td>`);
+    const tr=row(sb,`<td>${esc(s.email||s.userId)}</td><td>${esc(s.sellerCode||"")}</td><td><span class="pill ${esc(s.status)}">${esc(s.status)}</span></td><td></td><td>${money(s.balances.availableCents)}</td><td>${money(s.balances.committedCents)}</td><td style="white-space:nowrap"></td>`);
     const td=tr.lastElementChild;const inp=document.createElement("input");inp.type="number";inp.value=((s.commissionBps||0)/100).toFixed(2);inp.style.width="70px";
     td.append(inp,btn("Save","ghost",async()=>{try{await api(`/api/admin/sellers/${s.userId}`,{method:"PATCH",body:{commissionBps:Math.round(parseFloat(inp.value||0)*100)}});toast("Saved");}catch(e){toast(e.message);}}),
       btn("Suspend","bad",async()=>{try{await api(`/api/admin/sellers/${s.userId}/suspend`,{method:"POST",body:{}});toast("Suspended");refresh();}catch(e){toast(e.message);}}));
@@ -74,7 +75,7 @@ async function loadListings(){
   const pending=d.products.filter(p=>p.status!=="active");
   const mkTable=(items,pendingMode)=>{
     const t=document.createElement("table");t.innerHTML="<thead><tr><th>Product</th><th>Owner</th><th>Status</th><th>Variants</th><th></th></tr></thead>";const b=document.createElement("tbody");
-    for(const p of items){const tr=row(b,`<td>${p.name} <span class="muted">#${p.id}</span></td><td class="muted">${p.ownerEmail||("owner "+p.ownerId)}</td><td><span class="pill ${p.status}">${p.status}</span></td><td>${p.variants.map(v=>v.name+" ("+v.stockCount+")").join(", ")||"—"}</td><td style="white-space:nowrap"></td>`);
+    for(const p of items){const tr=row(b,`<td>${esc(p.name)} <span class="muted">#${p.id}</span></td><td class="muted">${esc(p.ownerEmail||("owner "+p.ownerId))}</td><td><span class="pill ${esc(p.status)}">${esc(p.status)}</span></td><td>${esc(p.variants.map(v=>v.name+" ("+v.stockCount+")").join(", "))||"—"}</td><td style="white-space:nowrap"></td>`);
       const td=tr.lastElementChild;
       if(pendingMode){td.append(btn("Approve","ok",()=>review(p.id,"active")),btn("Reject","bad",()=>review(p.id,"rejected")));}
       else{td.append(btn("Unlist","ghost",()=>review(p.id,"pending")));}
@@ -88,7 +89,7 @@ async function loadListings(){
 }
 async function loadPayouts(){
   const rows=await api("/api/admin/payouts");const tb=$("#payouts tbody");tb.innerHTML="";
-  for(const p of rows){const tr=row(tb,`<td>#${p.id}</td><td>${p.email||p.sellerId}</td><td>${money(p.amountCents)}</td><td>${p.method||""}</td><td>${p.destination||""}</td><td><span class="pill ${p.status}">${p.status}</span></td><td style="white-space:nowrap"></td>`);
+  for(const p of rows){const tr=row(tb,`<td>#${p.id}</td><td>${esc(p.email||p.sellerId)}</td><td>${money(p.amountCents)}</td><td>${esc(p.method||"")}</td><td>${esc(p.destination||"")}</td><td><span class="pill ${esc(p.status)}">${esc(p.status)}</span></td><td style="white-space:nowrap"></td>`);
     const td=tr.lastElementChild;
     if(p.status==="requested")td.append(btn("Approve","ghost",()=>act(p.id,"approve")));
     if(p.status==="requested"||p.status==="approved")td.append(btn("Mark paid","ok",()=>act(p.id,"pay")),btn("Reject","bad",()=>act(p.id,"reject")));
