@@ -721,7 +721,8 @@ def my_rank(user: dict = Depends(get_current_user)):
 def read_root(request: Request):
     # Uptime monitors get JSON; real browsers keep getting the SPA.
     if "text/html" in request.headers.get("accept", ""):
-        return FileResponse(os.path.join(FRONTEND, "index.html"))
+        return FileResponse(os.path.join(FRONTEND, "index.html"),
+                            headers={"Cache-Control": "no-cache"})
     return {"status": "ok", "message": "PhantomCardz API is running"}
 
 @app.get("/api/health")
