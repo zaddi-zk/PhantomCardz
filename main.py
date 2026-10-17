@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PhantomCardz — cards & accounts marketplace backend (FastAPI + SQLite)."""
-import os, secrets, random, time, hashlib, string, json
+import os, secrets, random, time, hashlib, string, json, threading
 import smtplib
 from datetime import datetime
 from email.message import EmailMessage
@@ -480,7 +480,10 @@ def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    start_telegram_poller()
+    try:
+        start_telegram_poller()
+    except Exception as e:
+        audit("telegram_poller_error", "-", str(e))
     yield
 
 app = FastAPI(title=f"{SITE} API", version="1.0.0", lifespan=lifespan)
