@@ -375,6 +375,12 @@ def ensure_schema(conn):
     # Per-card free text the SPA parses for city/state/zip (and delivers to the buyer).
     if not _has_col(conn, "cards", "extras"):
         conn.execute("ALTER TABLE cards ADD COLUMN extras TEXT DEFAULT ''")
+    # Optional per-card overrides set from the admin "Add Card" form (price is in
+    # cents like every other money column; NULL falls back to the base's values).
+    if not _has_col(conn, "cards", "price"):
+        conn.execute("ALTER TABLE cards ADD COLUMN price INTEGER")
+    if not _has_col(conn, "cards", "refundable"):
+        conn.execute("ALTER TABLE cards ADD COLUMN refundable INTEGER")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
 MONEY_COLUMNS = [
@@ -385,6 +391,7 @@ MONEY_COLUMNS = [
     ("wallet_codes", "value"),
     ("deposits", "amount"),
     ("card_bases", "price"),
+    ("cards", "price"),
     ("games_mines", "amount"),
     ("game_history", "amount"),
     ("game_history", "payout"),
@@ -1696,6 +1703,8 @@ def card_out(r, base_name=None, base_price=None, base_hr=None) -> dict:
     mm = int(r["exp_month"] or 0)
     yy = int(r["exp_year"] or 0)
     masked = (d[:6] + "•" * 6 + d[-4:]) if len(d) >= 10 else num
+    _card_price = r.get("price") if hasattr(r, "get") else None
+    _card_refund = r.get("refundable") if hasattr(r, "get") else None
     return {
         "id": r["id"],
         "cardNumber": num,
@@ -1704,7 +1713,8 @@ def card_out(r, base_name=None, base_price=None, base_hr=None) -> dict:
         "cvv": r["cvv"],
         "country": "US",
         "extras": ((r.get("extras") if hasattr(r, "get") else None) or ""),
-        "price": base_price if base_price is not None else None,
+        "price": _card_price if _card_price is not None else (base_price if base_price is not None else None),
+        "refundable": (bool(_card_refund) if _card_refund is not None else None),
         "hrPercent": base_hr if base_hr else 80,
         "isFirstHand": True,
         "isSold": bool(r["sold"]),
@@ -1749,6 +1759,7 @@ class BuyCardIn(BaseModel):
     baseId: Optional[int] = None
     extras: Optional[str] = None
     price: Optional[float] = None
+    refundable: Optional[bool] = None
 
 def _parse_card_line(line: str):
     """Parse one pasted "full item" line into card fields.
@@ -1791,22 +1802,23 @@ def _buy_card_random(base_id: int, user: dict):
     if not c:
         conn.close()
         raise ApiError(400, "Out of stock")
+    charge = c["price"] if c.get("price") is not None else b["price"]
     cur = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0",
                        (user["id"], c["id"]))
     if cur.rowcount != 1:
         conn.rollback(); conn.close()
         raise ApiError(400, "Card just sold, try again")
     cur2 = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
-                        (b["price"], user["id"], b["price"]))
+                        (charge, user["id"], charge))
     if cur2.rowcount != 1:
         conn.rollback(); conn.close()
         raise ApiError(400, "Insufficient balance")
     oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,paid_amount,created_at) "
                           "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (user["id"], None, 1, b["price"], "completed", "[]", "Balance", b["price"], now()))
+                    (user["id"], None, 1, charge, "completed", "[]", "Balance", charge, now()))
     conn.execute("UPDATE orders SET order_id=? WHERE id=?", (f"CARD-{oid}", oid))
     conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents,item_type,card_id) VALUES(?,?,?,?,?,?,?)",
-                 (oid, None, 1, b["price"], json.dumps([c["number"]]), "card", c["id"]))
+                 (oid, None, 1, charge, json.dumps([c["number"]]), "card", c["id"]))
     conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit()
@@ -1830,6 +1842,9 @@ def buy_or_add_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
             raise ApiError(400, "Base is required")
         if not (data.extras or "").strip():
             raise ApiError(400, "Full item is required")
+        # The admin form sends the price in dollars; money is stored in cents.
+        price_cents = int(round(data.price * 100)) if (data.price is not None and data.price > 0) else None
+        refundable = (1 if data.refundable else 0) if data.refundable is not None else None
         conn = db()
         b = conn.execute("SELECT id FROM card_bases WHERE id=? AND active=1", (data.baseId,)).fetchone()
         if not b:
@@ -1842,12 +1857,13 @@ def buy_or_add_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
                 if line.strip():
                     skipped += 1
                 continue
-            conn.execute("INSERT INTO cards(base_id,number,exp_month,exp_year,cvv,extras) VALUES(?,?,?,?,?,?)",
+            conn.execute("INSERT INTO cards(base_id,number,exp_month,exp_year,cvv,extras,price,refundable) "
+                         "VALUES(?,?,?,?,?,?,?,?)",
                          (data.baseId, parsed["number"], parsed["month"], parsed["year"],
-                          parsed["cvv"], parsed["extras"]))
+                          parsed["cvv"], parsed["extras"], price_cents, refundable))
             added += 1
         conn.commit(); conn.close()
-        audit("card_add", user["email"], f"base={data.baseId} added={added} skipped={skipped}")
+        audit("card_add", user["email"], f"base={data.baseId} added={added} skipped={skipped} price={price_cents}")
         return {"ok": True, "added": added, "addedCount": added,
                 "skipped": skipped, "skippedCount": skipped, "count": added}
     if not data.baseId:
@@ -3152,9 +3168,12 @@ def admin_list_bases(user: dict = Depends(get_current_user)):
 @app.post("/api/admin/card-bases")
 def admin_add_base(data: CardBaseIn, user: dict = Depends(get_current_user)):
     require_admin(user)
+    name = (data.name or "").strip()
+    if not name:
+        raise ApiError(400, "Base name is required")
     conn = db()
     bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,?)",
-                    (data.name, data.price, 1 if data.refundable else 0, data.hrPercent))
+                    (name, data.price, 1 if data.refundable else 0, data.hrPercent))
     conn.commit()
     conn.close()
     return {"ok": True, "id": bid}
@@ -3414,9 +3433,12 @@ class WorkerBaseIn(BaseModel):
 @app.post("/api/worker/card-bases")
 def worker_add_base(data: WorkerBaseIn, user: dict = Depends(get_current_user)):
     _require_staff(user)
+    name = (data.name or "").strip()
+    if not name:
+        raise ApiError(400, "Base name is required")
     conn = db()
     bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,80)",
-                    (data.name, data.price, 1 if data.refundable else 0))
+                    (name, data.price, 1 if data.refundable else 0))
     conn.commit(); conn.close()
     return {"id": bid, "ok": True}
 
@@ -3433,21 +3455,22 @@ def purchase_card(cid: int, data: Optional[PurchaseCardIn] = None, user: dict = 
     if not c:
         conn.close()
         raise ApiError(400, "Out of stock")
+    charge = c["price"] if c.get("price") is not None else c["base_price"]
     cur = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0", (user["id"], cid))
     if cur.rowcount != 1:
         conn.rollback(); conn.close()
         raise ApiError(400, "Card just sold, try again")
     cur2 = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
-                        (c["base_price"], user["id"], c["base_price"]))
+                        (charge, user["id"], charge))
     if cur2.rowcount != 1:
         conn.rollback(); conn.close()
         raise ApiError(400, "Insufficient balance")
     oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,paid_amount,created_at) "
                           "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (user["id"], None, 1, c["base_price"], "completed", "[]", "Balance", c["base_price"], now()))
+                    (user["id"], None, 1, charge, "completed", "[]", "Balance", charge, now()))
     conn.execute("UPDATE orders SET order_id=? WHERE id=?", (f"CARD-{oid}", oid))
     conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents,item_type,card_id) VALUES(?,?,?,?,?,?,?)",
-                 (oid, None, 1, c["base_price"], json.dumps([c["number"]]), "card", cid))
+                 (oid, None, 1, charge, json.dumps([c["number"]]), "card", cid))
     conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
     u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
     conn.commit(); conn.close()
