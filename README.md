@@ -85,6 +85,7 @@ edit. `.env` is git-ignored; `.env.example` is committed.
 | `COOKIE_SECURE`  | Set `session` cookie `Secure` flag (requires HTTPS)           | `false`                                                          |
 | `TELEGRAM_BOT_TOKEN` | Bot token for order/deposit/ticket notifications (blank = off) | *(empty)*                                                    |
 | `TELEGRAM_CHAT_ID`  | Telegram chat id that receives notifications                  | *(empty)*                                                        |
+| `TELEGRAM_CHANNEL_URL` | Telegram channel shown in the post-signup welcome prompt (blank = no prompt) | *(empty)*                              |
 | `TELEGRAM_VOUCH_URL` | Where the "Vouch" button sends users (channel/invite/bot link) | `https://t.me/+3-lMkt-idutkOTIx`                              |
 | `PASSWORD_SALT`  | Static password-hash salt; keep stable (changing it invalidates passwords) | `PhantomCardz-pbkdf2-static-v1`                       |
 

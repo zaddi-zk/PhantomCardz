@@ -55,6 +55,7 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 RESET_DEV_CODE = os.getenv("RESET_DEV_CODE", "true").lower() == "true"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 VOUCH_TG_URL = os.getenv("TELEGRAM_VOUCH_URL", "https://t.me/+3-lMkt-idutkOTIx")
+TELEGRAM_CHANNEL_URL = os.getenv("TELEGRAM_CHANNEL_URL", "").strip()
 
 try:
     import payments as npp   # NOWPayments integration (optional)
@@ -695,6 +696,10 @@ def read_root(request: Request):
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "api"}
+
+@app.get("/api/public-config")
+def public_config():
+    return {"siteName": SITE, "telegramChannelUrl": TELEGRAM_CHANNEL_URL}
 
 @app.get("/api/announcements")
 def announcements():

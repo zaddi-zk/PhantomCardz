@@ -8,13 +8,88 @@
     <link rel="icon" type="image/svg+xml" href="/phantom-cardz-favicon.svg" />
     <link rel="preconnect" href="https://fonts.googleapis.com/">
     <link rel="preconnect" href="https://fonts.gstatic.com/" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Architects+Daughter&family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=Fira+Code:wght@300..700&family=Geist+Mono:wght@100..900&family=Geist:wght@100..900&family=IBM+Plex+Mono:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;1,100;1,200;1,300;1,400;1,500;1,600;1,700&family=IBM+Plex+Sans:ital,wght@0,100..700;1,100..700&family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Lora:ital,wght@0,400..700;1,400..700&family=Merriweather:ital,opsz,wght@0,18..144,300..900;1,18..144,300..900&family=Montserrat:ital,wght@0,100..900;1,100..900&family=Open+Sans:ital,wght@0,300..800;1,300..800&family=Outfit:wght@100..900&family=Oxanium:wght@200..800&family=Playfair+Display:ital,wght@0,400..900;1,400..900&family=Plus+Jakarta+Sans:ital,wght@0,200..800;1,200..800&family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&family=Roboto+Mono:ital,wght@0,100..700;1,100..700&family=Roboto:ital,wght@0,100..900;1,100..900&family=Source+Code+Pro:ital,wght@0,200..900;1,200..900&family=Source+Serif+4:ital,opsz,wght@0,8..60,200..900;1,8..60,200..900&family=Space+Grotesk:wght@300..700&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Orbitron:wght@400..900&family=Rajdhani:wght@300..700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Architects+Daughter&family=DM+Sans:ital,opsz,wght@0,9..40,100..1000;1,9..40,100..1000&family=Fira+Code:wght@300..700&family=Geist+Mono:wght@100..900&family=Geist:wght@100..900&family=IBM+Plex+Mono:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;1,100;1,200;1,300;1,400;1,500;1,600;1,700&family=IBM+Plex+Sans:ital,wght@0,100..700;1,100..700&family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&family=Lora:ital,wght@0,400..700;1,400..700&family=Merriweather:ital,opsz,wght@0,18..144,300..900;1,18..144,300..900&family=Montserrat:ital,wght@0,100..900;1,100..900&family=Open+Sans:ital,wght@0,300..800;1,300..800&family=Outfit:wght@100..900;1,100..900&family=Oxanium:wght@200..800;1,200..800&family=Playfair+Display:ital,wght@0,400..900;1,400..900&family=Plus+Jakarta+Sans:ital,wght@0,200..800;1,200..800&family=Poppins:ital,wght@0,100..900;1,100..900&family=Roboto+Mono:ital,wght@0,100..700;1,100..700&family=Roboto:ital,wght@0,100..900;1,100..900&family=Source+Code+Pro:ital,wght@0,200..900;1,200..900&family=Source+Serif+4:ital,opsz,wght@0,8..60,200..900;1,8..60,200..900&family=Space+Grotesk:wght@300..700;1,300..700&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&family=Orbitron:wght@400..900;1,400..900&family=Rajdhani:wght@300..700;1,300..700&display=swap" rel="stylesheet">
     <script type="module" crossorigin src="assets/index-BogXwKPi.js"></script>
     <link rel="stylesheet" crossorigin href="assets/index-D5Vl73BB.css">
     <link rel="stylesheet" href="auth-layout.css">
+    <style>
+      .pcz-welcome-backdrop{position:fixed;inset:0;z-index:2147483000;display:flex;align-items:center;justify-content:center;padding:20px;background:rgba(6,6,9,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);opacity:0;transition:opacity .22s ease}
+      .pcz-welcome-backdrop.pcz-in{opacity:1}
+      .pcz-welcome-card{position:relative;width:100%;max-width:400px;border-radius:22px;padding:30px 26px 24px;text-align:center;background:radial-gradient(120% 120% at 50% 0%,#201636 0%,#15121c 55%,#100e14 100%);border:1px solid rgba(255,255,255,.09);box-shadow:0 24px 70px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.02) inset;transform:translateY(14px) scale(.97);opacity:0;transition:transform .28s cubic-bezier(.2,.9,.3,1.2),opacity .25s ease}
+      .pcz-welcome-backdrop.pcz-in .pcz-welcome-card{transform:none;opacity:1}
+      .pcz-welcome-badge{width:66px;height:66px;margin:0 auto 16px;border-radius:20px;display:flex;align-items:center;justify-content:center;background:linear-gradient(145deg,#2AABEE,#229ED9);box-shadow:0 10px 26px rgba(34,158,217,.4)}
+      .pcz-welcome-badge svg{width:38px;height:38px;color:#fff}
+      .pcz-welcome-title{margin:0 0 8px;font-size:22px;line-height:1.2;font-weight:800;letter-spacing:-.02em;color:#fff;font-family:'DM Sans',system-ui,sans-serif}
+      .pcz-welcome-text{margin:0 0 22px;font-size:14px;line-height:1.55;color:rgba(255,255,255,.62);font-family:'DM Sans',system-ui,sans-serif}
+      .pcz-welcome-actions{display:flex;flex-direction:column;gap:10px}
+      .pcz-welcome-btn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;min-height:50px;border-radius:14px;border:0;cursor:pointer;font-size:15px;font-weight:700;font-family:'DM Sans',system-ui,sans-serif;transition:transform .12s ease,filter .12s ease,background .12s ease;text-decoration:none}
+      .pcz-welcome-btn:active{transform:scale(.98)}
+      .pcz-welcome-btn svg{width:22px;height:22px;flex:none}
+      .pcz-welcome-tg{background:linear-gradient(145deg,#2AABEE,#229ED9);color:#fff;box-shadow:0 10px 24px rgba(34,158,217,.35)}
+      .pcz-welcome-tg:hover{filter:brightness(1.07)}
+      .pcz-welcome-later{background:rgba(255,255,255,.06);color:rgba(255,255,255,.78);border:1px solid rgba(255,255,255,.1)}
+      .pcz-welcome-later:hover{background:rgba(255,255,255,.11);color:#fff}
+      @media (max-width:420px){.pcz-welcome-card{padding:26px 20px 20px;border-radius:18px}.pcz-welcome-title{font-size:20px}}
+    </style>
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      (function () {
+        var shown = false;
+        function el(tag, cls, txt) {
+          var n = document.createElement(tag);
+          if (cls) n.className = cls;
+          if (txt) n.textContent = txt;
+          return n;
+        }
+        var TG_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>';
+        function close(backdrop) {
+          backdrop.classList.remove("pcz-in");
+          setTimeout(function () { if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop); }, 240);
+        }
+        function open(url) {
+          if (shown || !url) return;
+          shown = true;
+          var backdrop = el("div", "pcz-welcome-backdrop");
+          backdrop.setAttribute("role", "dialog");
+          backdrop.setAttribute("aria-modal", "true");
+          var card = el("div", "pcz-welcome-card");
+          var badge = el("div", "pcz-welcome-badge");
+          badge.innerHTML = TG_ICON;
+          card.appendChild(badge);
+          card.appendChild(el("h2", "pcz-welcome-title", "Welcome to PhantomCardz!"));
+          card.appendChild(el("p", "pcz-welcome-text", "Join our Telegram channel for drops, restocks and support \u2014 be the first to know."));
+          var actions = el("div", "pcz-welcome-actions");
+          var tg = el("a", "pcz-welcome-btn pcz-welcome-tg");
+          tg.href = url;
+          tg.target = "_blank";
+          tg.rel = "noopener noreferrer";
+          tg.innerHTML = TG_ICON + "<span>Join Telegram</span>";
+          tg.addEventListener("click", function () { close(backdrop); });
+          var later = el("button", "pcz-welcome-btn pcz-welcome-later", "Maybe Later");
+          later.type = "button";
+          later.addEventListener("click", function () { close(backdrop); });
+          actions.appendChild(tg);
+          actions.appendChild(later);
+          card.appendChild(actions);
+          backdrop.appendChild(card);
+          backdrop.addEventListener("click", function (e) { if (e.target === backdrop) close(backdrop); });
+          document.addEventListener("keydown", function onKey(e) {
+            if (e.key === "Escape") { close(backdrop); document.removeEventListener("keydown", onKey); }
+          });
+          document.body.appendChild(backdrop);
+          requestAnimationFrame(function () { backdrop.classList.add("pcz-in"); });
+          setTimeout(function () { tg.focus(); }, 60);
+        }
+        window.addEventListener("phantomcardz:signup-complete", function () {
+          fetch("/api/public-config", { credentials: "include" })
+            .then(function (r) { return r.ok ? r.json() : {}; })
+            .then(function (cfg) { open((cfg && cfg.telegramChannelUrl) || ""); })
+            .catch(function () {});
+        });
+      })();
+    </script>
   </body>
 
 </html>

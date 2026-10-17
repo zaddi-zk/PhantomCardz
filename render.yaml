@@ -41,6 +41,8 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: TELEGRAM_CHANNEL_URL
+        sync: false
       - key: TELEGRAM_VOUCH_URL
         sync: false
       - key: PASSWORD_SALT
