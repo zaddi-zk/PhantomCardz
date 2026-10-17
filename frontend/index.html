@@ -92,7 +92,6 @@
             .catch(function () {});
         }
         window.addEventListener("phantomcardz:signup-complete", showWelcome);
-        window.addEventListener("phantomcardz:logout-complete", showWelcome);
 
         var originalFetch = window.fetch;
         window.fetch = function (input, init) {
@@ -101,10 +100,8 @@
           return originalFetch.apply(this, arguments).then(function (response) {
             if (method === "POST" && response.ok) {
               var path = new URL(url, window.location.href).pathname;
-              if (path === "/api/register") {
+              if (path === "/api/login" || path === "/api/register") {
                 window.dispatchEvent(new Event("phantomcardz:signup-complete"));
-              } else if (path === "/api/logout") {
-                window.dispatchEvent(new Event("phantomcardz:logout-complete"));
               }
             }
             return response;
