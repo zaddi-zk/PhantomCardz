@@ -76,6 +76,7 @@ edit. `.env` is git-ignored; `.env.example` is committed.
 | `BTC_ADDRESS`    | Default BTC address in `manual_payments` defaults             | `bc1qphantom…dead`                                               |
 | `ETH_ADDRESS`    | Default ETH address in `manual_payments` defaults             | `0xPhantom…dead`                                                 |
 | `LTC_ADDRESS`    | Default LTC address in `manual_payments` defaults             | `ltc1qphantom…dead`                                              |
+| `SOL_ADDRESS`    | Default SOL address in `manual_payments` defaults             | `PhantomSoL1111…`                                                |
 | `NOWPAYMENTS_API_KEY` | Enables real-time crypto via NOWPayments (blank = static addresses + manual approval) | *(empty)*        |
 | `NOWPAYMENTS_IPN_SECRET` | HMAC secret that verifies NOWPayments IPN callbacks      | *(empty)*                                                        |
 | `NOWPAYMENTS_API_BASE` | Override API host (sandbox: `https://api-sandbox.nowpayments.io`) | `https://api.nowpayments.io`                            |

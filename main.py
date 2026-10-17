@@ -42,6 +42,7 @@ CASHAPP      = os.getenv("CASHAPP_HANDLE", "$PhantomCardz")
 BTC_ADDR     = os.getenv("BTC_ADDRESS", "bc1qphantom0000000000000000000000000000dead")
 ETH_ADDR     = os.getenv("ETH_ADDRESS", "0xPhantom000000000000000000000000000dead")
 LTC_ADDR     = os.getenv("LTC_ADDRESS", "ltc1qphantom00000000000000000000dead")
+SOL_ADDR     = os.getenv("SOL_ADDRESS", "PhantomSoL1111111111111111111111111111111111")
 DOMAINS      = [d.strip() for d in os.getenv("ALLOWED_HOSTS", "phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1").split(",") if d.strip()]
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 TG_BOT  = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -743,7 +744,11 @@ MANUAL_HANDLE_FIELD = {"cashapp": "tag", "venmo": "handle", "zelle": "handle",
 MANUAL_SETTING_KEY = {"cashapp": "cashapp-tag", "venmo": "venmo-handle",
                       "zelle": "zelle-handle", "chime": "chime-handle",
                       "applepay": "applepay-handle"}
-CRYPTO_ADDRESS_KEY = {"BTC": "bitcoin", "ETH": "ethereum", "LTC": "litecoin", "USDT": "ethereum"}
+CRYPTO_ADDRESS_KEY = {"BTC": "bitcoin", "ETH": "ethereum", "LTC": "litecoin",
+                      "SOL": "solana", "USDT": "ethereum"}
+# Only these tickers are offered for crypto deposits (payout wallets exist for
+# exactly these); any provider currency outside this set is filtered out.
+SUPPORTED_CRYPTO = ["BTC", "LTC", "ETH", "SOL"]
 
 def _json_setting(conn, key: str, fallback=None):
     r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -781,7 +786,9 @@ def manual_handle(conn, method: str, fallback: str = "") -> str:
 def crypto_address(conn, coin: str) -> str:
     mp = _json_setting(conn, "manual_payments", {}) or {}
     key = CRYPTO_ADDRESS_KEY.get((coin or "BTC").upper(), "bitcoin")
-    return mp.get(key) or {"bitcoin": BTC_ADDR, "ethereum": ETH_ADDR, "litecoin": LTC_ADDR}.get(key, BTC_ADDR)
+    defaults = {"bitcoin": BTC_ADDR, "ethereum": ETH_ADDR, "litecoin": LTC_ADDR,
+                "solana": SOL_ADDR}
+    return mp.get(key) or defaults.get(key, BTC_ADDR)
 
 def _deposit_client_status(s: str) -> str:
     """Map an internal deposit status to the vocabulary the SPA renders."""
@@ -1532,6 +1539,12 @@ def deposit_crypto(data: CryptoIn, user: dict = Depends(get_current_user)):
     return {"address": row.get("pay_address") or addr, "amount": cents, "currency": coin, "reference": ref,
             "status": "pending", "expiresAt": ts(now() + 3600)}
 
+def _supported_currencies(provider_currencies):
+    """Restrict the provider list to the tickers we actually have wallets for."""
+    have = {str(c).upper() for c in (provider_currencies or [])}
+    allowed = [c for c in SUPPORTED_CRYPTO if c in have]
+    return allowed or list(SUPPORTED_CRYPTO)
+
 @app.get("/api/payments/crypto/currencies")
 def crypto_currencies():
     if npp and npp.enabled():
@@ -1541,12 +1554,13 @@ def crypto_currencies():
         try:
             currencies = npp.get_currencies()
             if currencies:
-                _np_currencies_cache["value"] = currencies
+                allowed = _supported_currencies(currencies)
+                _np_currencies_cache["value"] = allowed
                 _np_currencies_cache["expires"] = time.time() + 600
-                return {"currencies": currencies}
+                return {"currencies": allowed}
         except Exception:
             pass
-    return {"currencies": list(CRYPTO_ADDRESS_KEY.keys())}
+    return {"currencies": list(SUPPORTED_CRYPTO)}
 
 _np_currencies_cache: Dict[str, Any] = {}
 

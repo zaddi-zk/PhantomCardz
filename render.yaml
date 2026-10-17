@@ -33,6 +33,8 @@ services:
         sync: false
       - key: LTC_ADDRESS
         sync: false
+      - key: SOL_ADDRESS
+        sync: false
       - key: ADMIN_TELEGRAM
         sync: false
       - key: TELEGRAM_BOT_TOKEN
