@@ -46,7 +46,9 @@ SOL_ADDR     = os.getenv("SOL_ADDRESS", "PhantomSoL11111111111111111111111111111
 DOMAINS      = [d.strip() for d in os.getenv("ALLOWED_HOSTS", "phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1").split(",") if d.strip()]
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 TG_BOT  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")          # comma-separated chat IDs that receive every site update
+TG_ADMIN_IDS = os.getenv("TELEGRAM_ADMIN_IDS", "")   # comma-separated chat IDs allowed to run /admin on the bot
+TG_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "") # optional channel/group that announcements are mirrored to
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -65,9 +67,10 @@ except Exception:            # pragma: no cover - optional dependency
 security = HTTPBearer(auto_error=False)
 
 class ApiError(Exception):
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, code: str = ""):
         self.status = status
         self.message = message
+        self.code = code
 
 def db():
     return connect_db(DB_PATH)
@@ -146,15 +149,38 @@ def audit(event: str, actor: str = "-", detail: str = ""):
     with open(os.path.join(LOGS, "audit.log"), "a") as f:
         f.write(f"{now()} | {event} | {actor} | {detail}\n")
 
+def _tg_id_list(raw: str):
+    """Parse a comma/semicolon separated list of Telegram chat IDs."""
+    out, seen = [], set()
+    for part in (raw or "").replace(";", ",").split(","):
+        cid = part.strip()
+        if cid and cid not in seen:
+            seen.add(cid); out.append(cid)
+    return out
+
+def _tg_notify_targets():
+    """Every chat that receives site-wide notifications (owners + admins)."""
+    out, seen = [], set()
+    for cid in _tg_id_list(TG_CHAT) + _tg_id_list(TG_ADMIN_IDS):
+        if cid not in seen:
+            seen.add(cid); out.append(cid)
+    return out
+
 def tg_notify(text: str):
-    if not (TG_BOT and TG_CHAT):
+    targets = _tg_notify_targets()
+    if not (TG_BOT and targets):
         return
     try:
         import urllib.request, urllib.parse as _up, threading
         def _send():
             url = f"https://api.telegram.org/bot{TG_BOT}/sendMessage"
-            data = _up.urlencode({"chat_id": TG_CHAT, "text": text}).encode()
-            urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+            for chat_id in targets:
+                try:
+                    data = _up.urlencode({"chat_id": chat_id, "text": text,
+                                          "disable_web_page_preview": "true"}).encode()
+                    urllib.request.urlopen(urllib.request.Request(url, data=data), timeout=10)
+                except Exception:
+                    pass
         threading.Thread(target=_send, daemon=True).start()
     except Exception:
         pass
@@ -520,7 +546,10 @@ async def maintenance_gate(request: Request, call_next):
 
 @app.exception_handler(ApiError)
 async def on_api_error(request, exc: ApiError):
-    return JSONResponse({"message": exc.message}, status_code=exc.status)
+    body = {"message": exc.message}
+    if getattr(exc, "code", ""):
+        body["code"] = exc.code
+    return JSONResponse(body, status_code=exc.status)
 
 @app.exception_handler(StarletteHTTPException)
 async def spa_or_json_404(request: Request, exc: StarletteHTTPException):
@@ -1136,7 +1165,7 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
         cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
                            (total, user["id"], total))
         if cur.rowcount != 1:
-            raise ApiError(400, "Insufficient balance")
+            raise ApiError(400, "Not enough funds. Top up your account to complete this purchase.", "insufficient_funds")
         first_vid = reserved[0][0]["id"] if reserved else None
         qty_total = sum(q for _, q, _ in reserved)
         items = []
@@ -1812,7 +1841,7 @@ def _buy_card_random(base_id: int, user: dict):
                         (charge, user["id"], charge))
     if cur2.rowcount != 1:
         conn.rollback(); conn.close()
-        raise ApiError(400, "Insufficient balance")
+        raise ApiError(400, "Not enough funds. Top up your account to complete this purchase.", "insufficient_funds")
     oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,paid_amount,created_at) "
                           "VALUES(?,?,?,?,?,?,?,?,?)",
                     (user["id"], None, 1, charge, "completed", "[]", "Balance", charge, now()))
@@ -2211,9 +2240,11 @@ def admin_set_role(uid: int, payload: Dict[str, Any], user: dict = Depends(get_c
     role = payload.get("role")
     if role not in ("user", "admin", "worker"):
         raise ApiError(400, "Invalid role")
-    conn = db(); _admin_target(conn, uid)
+    conn = db(); r = _admin_target(conn, uid)
     conn.execute("UPDATE users SET rank=? WHERE id=?", (role, uid))
     conn.commit(); audit("user_set_role", user["email"], f"target={uid} role={role}"); conn.close()
+    who = (r["username"] or r["email"]) if r else str(uid)
+    tg_notify(f"[{SITE}] {user['email']} set {who} role → {role}")
     return {"ok": True, "role": role, "isWorker": role == "worker"}
 
 @app.post("/api/admin/users/{uid}/set-worker")
@@ -2224,6 +2255,8 @@ def admin_set_worker(uid: int, payload: Dict[str, Any], user: dict = Depends(get
     if r["rank"] != "admin":
         conn.execute("UPDATE users SET rank=? WHERE id=?", ("worker" if is_worker else "user", uid))
     conn.commit(); audit("user_set_worker", user["email"], f"target={uid} isWorker={is_worker}"); conn.close()
+    who = (r["username"] or r["email"]) if r else str(uid)
+    tg_notify(f"[{SITE}] {user['email']} {'granted worker access to' if is_worker else 'removed worker access from'} {who}")
     return {"ok": True, "isWorker": is_worker}
 
 @app.post("/api/admin/users/{uid}/set-balance")
@@ -2424,7 +2457,13 @@ def admin_bulk_stock(data: BulkStockIn, user: dict = Depends(get_current_user)):
         conn.execute("INSERT INTO stock_items(variant_id,content,created_at) VALUES(?,?,?)",
                      (data.variantId, l, now()))
         added += 1
-    conn.commit(); conn.close()
+    conn.commit()
+    v = conn.execute("SELECT v.name AS vname, p.name AS pname FROM variants v "
+                     "LEFT JOIN products p ON p.id=v.productId WHERE v.id=?", (data.variantId,)).fetchone()
+    conn.close()
+    if added:
+        label = f"{(v['pname'] or '—')} / {(v['vname'] or '—')}" if v else f"variant {data.variantId}"
+        tg_notify(f"[{SITE}] {user['email']} added {added} stock item(s) to {label}")
     return {"ok": True, "added": added, "addedCount": added, "skipped": 0, "skippedCount": 0}
 
 @app.patch("/api/admin/stock/{variant_id}")
@@ -2567,6 +2606,8 @@ def admin_add_announcement(data: AnnounceIn, user: dict = Depends(get_current_us
     conn.execute("INSERT INTO announcements(content,link,active,bannerColor,created_at) VALUES(?,?,1,?,?)",
                  (data.content, data.link, data.bannerColor, now()))
     conn.commit(); conn.close()
+    if data.content:
+        threading.Thread(target=tg_broadcast, args=(data.content,), daemon=True).start()
     return {"ok": True}
 
 @app.delete("/api/admin/announcements/{aid}")
@@ -2699,6 +2740,9 @@ def seller_apply(data: SellerApplyIn, user: dict = Depends(get_current_user)):
                     motivation=excluded.motivation, status='pending'""",
                  (user["id"], telegram, motivation, "pending", now()))
     conn.commit(); conn.close()
+    tg_notify(f"[{SITE}] New partner/seller application from {user['email']}"
+              + (f" (tg {telegram})" if telegram else "")
+              + (f"\nMotivation: {str(motivation)[:300]}" if motivation else ""))
     return {"status": "pending"}
 
 @app.get("/api/seller/me")
@@ -2860,6 +2904,372 @@ def tg_send(chat_id, text: str):
     return tg_api("sendMessage", {"chat_id": chat_id, "text": text,
                                   "disable_web_page_preview": True})
 
+# ---------------- Telegram admin bot ----------------
+
+def _tg_ago(v) -> str:
+    try:
+        d = now() - int(v or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if d < 60:
+        return f"{d}s ago"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    if d < 86400:
+        return f"{d // 3600}h ago"
+    return f"{d // 86400}d ago"
+
+def _tg_money(cents) -> str:
+    try:
+        return f"${int(cents) / 100:,.2f}"
+    except (TypeError, ValueError):
+        return "$0.00"
+
+def _tg_admin_ids() -> set:
+    """Chat IDs allowed to control the bot: TELEGRAM_ADMIN_IDS, else the notify list."""
+    return set(_tg_id_list(TG_ADMIN_IDS) or _tg_id_list(TG_CHAT))
+
+def _tg_is_admin(chat_id) -> bool:
+    cid = str(chat_id)
+    if cid in _tg_admin_ids():
+        return True
+    conn = db()
+    try:
+        r = conn.execute("SELECT rank FROM users WHERE telegram_id=?", (cid,)).fetchone()
+        return bool(r and r.get("rank") == "admin")
+    finally:
+        conn.close()
+
+def _tg_send_kb(chat_id, text, kb=None):
+    payload = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if kb:
+        payload["reply_markup"] = kb
+    return tg_api("sendMessage", payload)
+
+def _tg_dashboard_kb():
+    return {"inline_keyboard": [
+        [{"text": "📊 Dashboard", "callback_data": "tg:dashboard"},
+         {"text": "📦 Stock", "callback_data": "tg:stock"},
+         {"text": "🧾 Orders", "callback_data": "tg:orders"}],
+        [{"text": "👥 Users", "callback_data": "tg:users"},
+         {"text": "💰 Deposits", "callback_data": "tg:deposits"},
+         {"text": "🤝 Sellers", "callback_data": "tg:sellers"}],
+        [{"text": "🕒 Activity", "callback_data": "tg:activity"},
+         {"text": "🔄 Refresh", "callback_data": "tg:dashboard"}],
+    ]}
+
+def _tg_stats() -> dict:
+    day = now() - 86400
+    conn = db()
+    try:
+        return conn.execute("""
+            SELECT
+              (SELECT COUNT(*) FROM users)                                       AS users,
+              (SELECT COUNT(*) FROM users WHERE created_at > ?)                  AS new_users,
+              (SELECT COUNT(*) FROM users WHERE rank='worker')                   AS workers,
+              (SELECT COUNT(*) FROM users WHERE rank='admin')                    AS admins,
+              (SELECT COUNT(*) FROM orders)                                      AS orders,
+              (SELECT COUNT(*) FROM orders WHERE created_at > ?)                 AS new_orders,
+              (SELECT COALESCE(SUM(total),0) FROM orders WHERE status='completed') AS revenue,
+              (SELECT COUNT(*) FROM deposits WHERE status='pending')             AS pending_deposits,
+              (SELECT COUNT(*) FROM cards WHERE sold=0)                          AS cards_unsold,
+              (SELECT COUNT(*) FROM cards WHERE sold=1)                          AS cards_sold,
+              (SELECT COUNT(*) FROM stock_items WHERE sold=0)                    AS stock_unsold,
+              (SELECT COUNT(*) FROM stock_items WHERE sold=1)                    AS stock_sold,
+              (SELECT COUNT(*) FROM seller_apps WHERE status='pending')          AS sellers_pending,
+              (SELECT COUNT(*) FROM tickets WHERE status='open')                 AS open_tickets
+        """, (day, day)).fetchone()
+    finally:
+        conn.close()
+
+def _tg_dashboard_text() -> str:
+    s = _tg_stats()
+    return (
+        f"📊 {SITE} — Admin dashboard\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👥 Users: {s['users']}  (＋{s['new_users']} in 24h)\n"
+        f"🧑‍💼 Workers: {s['workers']}   🛡 Admins: {s['admins']}\n"
+        f"🧾 Orders: {s['orders']}  (＋{s['new_orders']} in 24h)\n"
+        f"💰 Revenue: {_tg_money(s['revenue'])}\n"
+        f"⏳ Pending deposits: {s['pending_deposits']}\n"
+        f"🆘 Open tickets: {s['open_tickets']}\n"
+        f"🤝 Seller apps pending: {s['sellers_pending']}\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"💳 Cards: {s['cards_unsold']} unsold · {s['cards_sold']} sold\n"
+        f"📦 Stock: {s['stock_unsold']} in stock · {s['stock_sold']} sold\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Sections: /stock /orders /users /deposits /sellers /activity\n"
+        "Message users: /broadcast <text> · /announce <text>\n"
+        "Accounts: /credit <user> <$> · /dm <user> <text> · /ban /unban"
+    )
+
+def _tg_stock_text() -> str:
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT COALESCE(p.name,'—') AS product, COALESCE(v.name,'—') AS variant,
+                   SUM(CASE WHEN s.sold=0 THEN 1 ELSE 0 END) AS unsold,
+                   COUNT(s.id) AS total
+            FROM variants v
+            LEFT JOIN products p ON p.id=v.productId
+            LEFT JOIN stock_items s ON s.variant_id=v.id
+            GROUP BY v.id ORDER BY p.name, v.name
+        """).fetchall()
+        bases = conn.execute("""
+            SELECT cb.name AS base,
+                   SUM(CASE WHEN c.sold=0 THEN 1 ELSE 0 END) AS unsold,
+                   COUNT(c.id) AS total
+            FROM card_bases cb LEFT JOIN cards c ON c.base_id=cb.id
+            GROUP BY cb.id ORDER BY cb.name
+        """).fetchall()
+    finally:
+        conn.close()
+    lines = ["📦 Stock by product", "━━━━━━━━━━━━━━━"]
+    lines += [f"• {r['product']} / {r['variant']}: {r['unsold'] or 0} avail · {r['total'] or 0} total" for r in rows] or ["• no products"]
+    lines += ["", "💳 Cards by base", "━━━━━━━━━━━━━━━"]
+    lines += [f"• {b['base']}: {b['unsold'] or 0} avail · {b['total'] or 0} total" for b in bases] or ["• no bases"]
+    return "\n".join(lines)
+
+def _tg_orders_text(limit: int = 10) -> str:
+    conn = db()
+    try:
+        rows = conn.execute("""SELECT o.order_id, o.total, o.status, o.created_at, u.email
+                               FROM orders o LEFT JOIN users u ON u.id=o.user_id
+                               ORDER BY o.id DESC LIMIT ?""", (limit,)).fetchall()
+    finally:
+        conn.close()
+    lines = ["🧾 Latest orders", "━━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"• {(r['order_id'] or '—')[:18]} · {_tg_money(r['total'])} · {r['status']} · {_tg_ago(r['created_at'])}")
+        lines.append(f"   {r['email'] or '—'}")
+    if not rows:
+        lines.append("• none yet")
+    return "\n".join(lines)
+
+def _tg_users_text(limit: int = 10) -> str:
+    conn = db()
+    try:
+        rows = conn.execute("""SELECT username, email, balance, rank, created_at
+                               FROM users ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+    finally:
+        conn.close()
+    lines = ["👥 Latest users", "━━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"• {r['username'] or '—'} · {_tg_money(r['balance'])} · {r['rank']} · {_tg_ago(r['created_at'])}\n   {r['email']}")
+    if not rows:
+        lines.append("• none yet")
+    return "\n".join(lines)
+
+def _tg_deposits_text() -> str:
+    conn = db()
+    try:
+        rows = conn.execute("""SELECT d.id, d.method, d.amount, d.reference, d.created_at, u.email
+                               FROM deposits d LEFT JOIN users u ON u.id=d.user_id
+                               WHERE d.status='pending' ORDER BY d.id DESC LIMIT 20""").fetchall()
+    finally:
+        conn.close()
+    lines = [f"💰 Pending deposits ({len(rows)})", "━━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"• #{r['id']} {_tg_money(r['amount'])} {r['method']} · {r['email'] or '—'} · {_tg_ago(r['created_at'])}")
+        if r["reference"]:
+            lines.append(f"   ref {r['reference']}")
+    if not rows:
+        lines.append("• none pending 🎉")
+    return "\n".join(lines)
+
+def _tg_sellers_text() -> str:
+    conn = db()
+    try:
+        rows = conn.execute("""SELECT s.status, s.telegram, s.motivation, s.created_at, u.username, u.email
+                               FROM seller_apps s LEFT JOIN users u ON u.id=s.user_id
+                               ORDER BY s.id DESC LIMIT 15""").fetchall()
+    finally:
+        conn.close()
+    lines = ["🤝 Seller / partner applications", "━━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"• {r['username'] or r['email'] or '—'} · {r['status']} · {_tg_ago(r['created_at'])}")
+        if r["telegram"]:
+            lines.append(f"   tg {r['telegram']}")
+        if r["motivation"]:
+            lines.append(f"   “{str(r['motivation'])[:120]}”")
+    if not rows:
+        lines.append("• none yet")
+    return "\n".join(lines)
+
+def _tg_activity_text() -> str:
+    conn = db()
+    try:
+        users = conn.execute("SELECT username, email, created_at FROM users ORDER BY id DESC LIMIT 5").fetchall()
+        orders = conn.execute("SELECT order_id, total, created_at FROM orders ORDER BY id DESC LIMIT 5").fetchall()
+        deps = conn.execute("SELECT method, amount, status, created_at FROM deposits ORDER BY id DESC LIMIT 5").fetchall()
+        sellers = conn.execute("SELECT status, created_at FROM seller_apps ORDER BY id DESC LIMIT 3").fetchall()
+    finally:
+        conn.close()
+    lines = ["🕒 Recent activity", "━━━━━━━━━━━━━━━", "", "🆕 Users"]
+    lines += [f"• {r['username'] or r['email']} · {_tg_ago(r['created_at'])}" for r in users] or ["• —"]
+    lines += ["", "🧾 Orders"]
+    lines += [f"• {(r['order_id'] or '—')[:18]} · {_tg_money(r['total'])} · {_tg_ago(r['created_at'])}" for r in orders] or ["• —"]
+    lines += ["", "💰 Deposits"]
+    lines += [f"• {r['method']} {_tg_money(r['amount'])} {r['status']} · {_tg_ago(r['created_at'])}" for r in deps] or ["• —"]
+    if sellers:
+        lines += ["", "🤝 Seller apps"]
+        lines += [f"• {r['status']} · {_tg_ago(r['created_at'])}" for r in sellers]
+    return "\n".join(lines)
+
+_TG_SECTIONS = {
+    "dashboard": _tg_dashboard_text, "dash": _tg_dashboard_text, "admin": _tg_dashboard_text,
+    "stats": _tg_dashboard_text, "home": _tg_dashboard_text,
+    "stock": _tg_stock_text, "orders": _tg_orders_text, "users": _tg_users_text,
+    "user": _tg_users_text, "deposits": _tg_deposits_text, "payments": _tg_deposits_text,
+    "sellers": _tg_sellers_text, "partners": _tg_sellers_text, "activity": _tg_activity_text,
+}
+
+def _tg_section(name) -> str:
+    fn = _TG_SECTIONS.get((name or "dashboard").lower(), _tg_dashboard_text)
+    try:
+        return fn()
+    except Exception as e:
+        audit("telegram_section_error", name, str(e))
+        return "⚠️ Could not build that view."
+
+def _tg_help_text() -> str:
+    return (
+        f"🤖 {SITE} bot\n"
+        "━━━━━━━━━━━━━━━\n"
+        "Users:\n"
+        "• /start — welcome + link help\n"
+        "• /link CODE — connect your site account\n"
+        "• /id — show your Telegram chat ID\n"
+        "\nAdmins (/admin):\n"
+        "• /admin or /dashboard — live stats panel\n"
+        "• /stock /orders /users /deposits /sellers /activity\n"
+        "• /broadcast <text> — message every linked user\n"
+        "• /announce <text> — post an announcement + notify users\n"
+        "• /dm <user> <text> — direct message one user\n"
+        "• /credit <user> <amount> — add funds (recorded as a deposit)\n"
+        "• /ban <user> · /unban <user>"
+    )
+
+def tg_broadcast(text: str) -> dict:
+    """Send a message to every Telegram-linked user (plus the channel if set)."""
+    text = (text or "").strip()
+    if not (TG_BOT and text):
+        return {"sent": 0, "failed": 0, "targets": 0}
+    conn = db()
+    try:
+        rows = conn.execute("SELECT telegram_id FROM users "
+                            "WHERE telegram_id IS NOT NULL AND telegram_id<>''").fetchall()
+    finally:
+        conn.close()
+    sent = failed = 0
+    for r in rows:
+        res = tg_api("sendMessage", {"chat_id": r["telegram_id"], "text": text,
+                                     "disable_web_page_preview": True})
+        if res and res.get("ok"):
+            sent += 1
+        else:
+            failed += 1
+        time.sleep(0.05)  # stay well under Telegram's rate limit
+    if TG_CHANNEL_ID:
+        tg_send(TG_CHANNEL_ID, text)
+    return {"sent": sent, "failed": failed, "targets": len(rows)}
+
+def _tg_announce(text: str, actor: str) -> dict:
+    text = (text or "").strip()
+    if not text:
+        return {"sent": 0, "failed": 0, "targets": 0}
+    conn = db()
+    conn.execute("INSERT INTO announcements(content,link,active,bannerColor,created_at) "
+                 "VALUES(?,?,1,?,?)", (text, None, "#000000", now()))
+    conn.commit(); conn.close()
+    audit("announcement_tg", actor, text[:200])
+    return tg_broadcast(text)
+
+def _tg_find_user(token):
+    token = (token or "").strip().lstrip("@")
+    if not token:
+        return None
+    conn = db()
+    try:
+        if token.isdigit():
+            return conn.execute("SELECT * FROM users WHERE id=?", (int(token),)).fetchone()
+        return conn.execute("SELECT * FROM users WHERE email=? OR username=?",
+                            (token, token)).fetchone()
+    finally:
+        conn.close()
+
+def _tg_credit(actor: str, token: str, amount) -> str:
+    u = _tg_find_user(token)
+    if not u:
+        return f"❌ No user found for “{token}”."
+    try:
+        cents = to_cents(amount)
+    except (TypeError, ValueError):
+        return "❌ Invalid amount."
+    if cents == 0:
+        return "❌ Amount must not be zero."
+    conn = db()
+    ref = f"ADM-{secrets.token_hex(4).upper()}"
+    insert_id(conn, "INSERT INTO deposits(user_id,method,amount,reference,status,payin_extra_id,settled_at,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+              (u["id"], "admin", cents, ref, "approved", "telegram admin", now(), now()))
+    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (cents, u["id"]))
+    bal = conn.execute("SELECT balance FROM users WHERE id=?", (u["id"],)).fetchone()["balance"]
+    conn.commit(); conn.close()
+    audit("user_credit", actor, f"target={u['id']} cents={cents} ref={ref} via=telegram")
+    return f"✅ Credited {_tg_money(cents)} to {u['username'] or u['email']}. New balance {_tg_money(bal)}."
+
+def _tg_set_ban(actor: str, token: str, banned: bool) -> str:
+    u = _tg_find_user(token)
+    if not u:
+        return f"❌ No user found for “{token}”."
+    conn = db()
+    conn.execute("UPDATE users SET is_banned=? WHERE id=?", (1 if banned else 0, u["id"]))
+    conn.commit(); conn.close()
+    audit("user_ban" if banned else "user_unban", actor, f"target={u['id']} via=telegram")
+    return f"{'🚫 Banned' if banned else '✅ Unbanned'} {u['username'] or u['email']}."
+
+def _tg_dm(actor: str, token: str, text: str) -> str:
+    u = _tg_find_user(token)
+    if not u:
+        return f"❌ No user found for “{token}”."
+    if not u.get("telegram_id"):
+        return f"❌ {u['username'] or u['email']} has not linked Telegram."
+    if not (text or "").strip():
+        return "Usage: /dm <user> <message>"
+    res = tg_send(u["telegram_id"], text)
+    audit("tg_dm", actor, f"target={u['id']}")
+    return "✅ Sent." if (res and res.get("ok")) else "⚠️ Could not deliver."
+
+_TG_ADMIN_CMDS = {"dashboard", "admin", "stats", "dash", "home", "stock", "orders",
+                  "users", "user", "deposits", "payments", "sellers", "partners",
+                  "activity", "broadcast", "announce", "credit", "dm", "ban", "unban"}
+
+def _tg_handle_admin_command(chat_id, cmd: str, args, actor: str):
+    if cmd in ("broadcast", "announce"):
+        text = " ".join(args).strip()
+        if not text:
+            tg_send(chat_id, f"Usage: /{cmd} <message>")
+            return
+        r = tg_broadcast(text) if cmd == "broadcast" else _tg_announce(text, actor)
+        verb = "Broadcast sent to" if cmd == "broadcast" else "Announcement posted to site +"
+        tg_send(chat_id, f"📣 {verb} {r['sent']} users ({r['failed']} failed, {r['targets']} linked).")
+        return
+    if cmd == "credit":
+        tg_send(chat_id, _tg_credit(actor, args[0] if args else "", args[1] if len(args) > 1 else None))
+        return
+    if cmd == "dm":
+        tg_send(chat_id, _tg_dm(actor, args[0] if args else "", " ".join(args[1:]).strip()))
+        return
+    if cmd == "ban":
+        tg_send(chat_id, _tg_set_ban(actor, args[0] if args else "", True))
+        return
+    if cmd == "unban":
+        tg_send(chat_id, _tg_set_ban(actor, args[0] if args else "", False))
+        return
+    # everything else is a dashboard section
+    _tg_send_kb(chat_id, _tg_section(cmd), _tg_dashboard_kb())
+
 def _tg_link_user(chat_id, from_user, code: str):
     """Handle ``/link CODE`` from a private chat: verify the code and link."""
     first = (from_user.get("first_name") or "").strip()
@@ -2901,7 +3311,21 @@ def _tg_link_user(chat_id, from_user, code: str):
     audit("telegram_link", handle or tg_uid, f"user_id={row['user_id']}")
 
 def process_telegram_update(update: dict):
-    """Handle a single Telegram update (only ``/link`` and ``/start`` matter)."""
+    """Route one Telegram update: account linking for users, dashboard for admins."""
+    # Inline-keyboard taps on the admin dashboard.
+    cb = update.get("callback_query")
+    if cb:
+        cb_chat = ((cb.get("message") or {}).get("chat") or {}).get("id")
+        data = cb.get("data") or ""
+        tg_api("answerCallbackQuery", {"callback_query_id": cb.get("id")})
+        if not cb_chat or not data.startswith("tg:"):
+            return
+        if not _tg_is_admin(cb_chat):
+            tg_send(cb_chat, "⛔ PhantomCardz admins only.")
+            return
+        _tg_send_kb(cb_chat, _tg_section(data.split(":", 1)[1] or "dashboard"), _tg_dashboard_kb())
+        return
+
     msg = update.get("message") or update.get("edited_message")
     if not msg:
         return
@@ -2916,15 +3340,33 @@ def process_telegram_update(update: dict):
             tg_send(chat_id, "For your security, send /link CODE to me in a private chat.")
         return
     parts = text.split()
-    if low.startswith("/link"):
-        code = parts[1].strip().upper() if len(parts) > 1 else ""
+    cmd = parts[0].lstrip("/").split("@")[0].lower() if parts else ""
+    args = parts[1:]
+    actor = (msg.get("from") or {}).get("username") or str(chat_id)
+    if cmd == "link":
+        code = args[0].strip().upper() if args else ""
         if not code:
             tg_send(chat_id, "Usage: /link CODE — generate a code on your Account page first.")
             return
         _tg_link_user(chat_id, msg.get("from") or {}, code)
-    elif low.startswith("/start"):
-        tg_send(chat_id, f"Welcome to {SITE}! To link your account, generate a one-time code on "
-                         "the Account page, then send /link CODE here in this private chat.")
+        return
+    if cmd == "start":
+        if _tg_is_admin(chat_id):
+            tg_send(chat_id, f"Welcome back, admin. Send /admin for the live {SITE} dashboard.")
+        else:
+            tg_send(chat_id, f"Welcome to {SITE}! To link your account, generate a one-time code "
+                             "on the Account page, then send /link CODE here in this private chat.")
+        return
+    if cmd in ("help", "id", "whoami"):
+        tg_send(chat_id, _tg_help_text() if cmd == "help" else f"Your Telegram chat ID: {chat_id}")
+        return
+    if cmd in _TG_ADMIN_CMDS:
+        if not _tg_is_admin(chat_id):
+            tg_send(chat_id, "⛔ This command is for PhantomCardz admins only.")
+            return
+        _tg_handle_admin_command(chat_id, cmd, args, actor)
+        return
+    tg_send(chat_id, "Unknown command. Send /help to see what I can do.")
 
 _tg_poller_started = {"flag": False}
 
@@ -2932,7 +3374,7 @@ def _tg_poll_loop():
     tg_api("deleteWebhook", {"drop_pending_updates": False})
     offset = None
     while True:
-        params = {"timeout": 30, "allowed_updates": json.dumps(["message", "edited_message"])}
+        params = {"timeout": 30, "allowed_updates": json.dumps(["message", "edited_message", "callback_query"])}
         if offset is not None:
             params["offset"] = offset
         res = tg_api("getUpdates", params, timeout=40)
@@ -3512,7 +3954,7 @@ def purchase_card(cid: int, data: Optional[PurchaseCardIn] = None, user: dict = 
                         (charge, user["id"], charge))
     if cur2.rowcount != 1:
         conn.rollback(); conn.close()
-        raise ApiError(400, "Insufficient balance")
+        raise ApiError(400, "Not enough funds. Top up your account to complete this purchase.", "insufficient_funds")
     oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,paid_amount,created_at) "
                           "VALUES(?,?,?,?,?,?,?,?,?)",
                     (user["id"], None, 1, charge, "completed", "[]", "Balance", charge, now()))
