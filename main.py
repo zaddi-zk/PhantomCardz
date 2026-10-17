@@ -1849,7 +1849,7 @@ def buy_or_add_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
         conn.commit(); conn.close()
         audit("card_add", user["email"], f"base={data.baseId} added={added} skipped={skipped}")
         return {"ok": True, "added": added, "addedCount": added,
-                "skipped": skipped, "skippedCount": skipped}
+                "skipped": skipped, "skippedCount": skipped, "count": added}
     if not data.baseId:
         raise ApiError(400, "Base is required")
     return _buy_card_random(data.baseId, user)
