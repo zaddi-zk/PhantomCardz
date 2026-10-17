@@ -56,7 +56,7 @@ SMTP_PASS = os.getenv("SMTP_PASSWORD", "")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 RESET_DEV_CODE = os.getenv("RESET_DEV_CODE", "true").lower() == "true"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-VOUCH_TG_URL = os.getenv("TELEGRAM_VOUCH_URL", "https://t.me/+3-lMkt-idutkOTIx")
+VOUCH_TG_URL = os.getenv("TELEGRAM_VOUCH_URL", "https://t.me/phantomCardz")
 TELEGRAM_CHANNEL_URL = os.getenv("TELEGRAM_CHANNEL_URL", "").strip() or "https://t.me/phantomCardz"
 
 try:
