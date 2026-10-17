@@ -55,7 +55,7 @@ SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 RESET_DEV_CODE = os.getenv("RESET_DEV_CODE", "true").lower() == "true"
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 VOUCH_TG_URL = os.getenv("TELEGRAM_VOUCH_URL", "https://t.me/+3-lMkt-idutkOTIx")
-TELEGRAM_CHANNEL_URL = os.getenv("TELEGRAM_CHANNEL_URL", "").strip()
+TELEGRAM_CHANNEL_URL = os.getenv("TELEGRAM_CHANNEL_URL", "").strip() or "https://t.me/phantomCardz"
 
 try:
     import payments as npp   # NOWPayments integration (optional)
@@ -295,6 +295,12 @@ CREATE TABLE IF NOT EXISTS seller_apps(
 CREATE TABLE IF NOT EXISTS telegram_claims(
     user_id INTEGER PRIMARY KEY, last_claim INTEGER
 );
+CREATE TABLE IF NOT EXISTS telegram_link_codes(
+    code TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    created_at INTEGER,
+    used INTEGER DEFAULT 0
+);
 """
 
 def luhn_generate(length: int = 16) -> str:
@@ -364,6 +370,8 @@ def ensure_schema(conn):
     for _col, _ddl in (("order_id", "TEXT"), ("image_url", "TEXT")):
         if not _has_col(conn, "tickets", _col):
             conn.execute(f"ALTER TABLE tickets ADD COLUMN {_col} {_ddl}")
+    if not _has_col(conn, "users", "telegram_id"):
+        conn.execute("ALTER TABLE users ADD COLUMN telegram_id TEXT")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
 MONEY_COLUMNS = [
@@ -472,6 +480,7 @@ def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    start_telegram_poller()
     yield
 
 app = FastAPI(title=f"{SITE} API", version="1.0.0", lifespan=lifespan)
@@ -541,8 +550,13 @@ def role_flags(u) -> dict:
     return {"role": rank, "isWorker": rank == "worker", "isBanned": bool(banned)}
 
 def user_out(u) -> dict:
+    tg = u.get("telegram") if hasattr(u, "get") else None
     return {"id": u["id"], "email": u["email"], "username": u["username"],
-            "balance": u["balance"], "rank": u["rank"], **role_flags(u)}
+            "balance": u["balance"], "protectedBalance": 0,
+            "rank": u["rank"], "telegramUsername": (tg.lstrip("@") if tg else None),
+            "telegramId": (u.get("telegram_id") if hasattr(u, "get") else None),
+            "lastDailySpin": None, "createdAt": ts(u["created_at"]),
+            **role_flags(u)}
 
 def get_setting(conn, key: str, fallback="{}"):
     r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -617,10 +631,8 @@ def me(user: dict = Depends(get_current_user)):
     spent = conn.execute("SELECT COALESCE(SUM(total),0) FROM orders WHERE user_id=? AND status='completed'",
                          (user["id"],)).fetchone()[0]
     conn.close()
-    return {"id": user["id"], "email": user["email"], "username": user["username"],
-            "balance": user["balance"], "rank": user["rank"],
-            "telegram": user["telegram"], "orders": n, "totalSpent": round(spent, 2),
-            **role_flags(user)}
+    return {**user_out(user), "telegram": user["telegram"], "orders": n,
+            "totalSpent": round(spent, 2)}
 
 @app.post("/api/logout")
 def logout(user: dict = Depends(get_current_user)):
@@ -639,14 +651,20 @@ class PasswordIn(BaseModel):
 @app.post("/api/user/password")
 @app.patch("/api/user/password")
 def change_password(data: PasswordIn, user: dict = Depends(get_current_user)):
+    if len(data.newPassword or "") < 6:
+        raise ApiError(400, "New password must be at least 6 characters")
     conn = db()
     if not verify_pw(data.currentPassword, user["email"], user["password_hash"]):
         conn.close()
         raise ApiError(400, "Wrong password")
+    if data.currentPassword == data.newPassword:
+        conn.close()
+        raise ApiError(400, "New password must differ from the current password")
     conn.execute("UPDATE users SET password_hash=? WHERE id=?",
                  (h(data.newPassword, user["email"]), user["id"]))
     conn.commit()
     conn.close()
+    audit("change_password", user["email"], "password updated")
     return {"ok": True}
 
 class EmailIn(BaseModel):
@@ -657,20 +675,30 @@ class EmailIn(BaseModel):
 @app.post("/api/user/email")
 @app.patch("/api/user/email")
 def change_email(data: EmailIn, user: dict = Depends(get_current_user)):
-    new_email = data.newEmail or data.email
-    if not new_email:
-        raise ApiError(400, "Email required")
+    new_email = (data.newEmail or data.email or "").strip().lower()
+    if "@" not in new_email or "." not in new_email.rsplit("@", 1)[-1] or " " in new_email:
+        raise ApiError(400, "Enter a valid email address")
     conn = db()
     if data.password is not None and not verify_pw(data.password, user["email"], user["password_hash"]):
         conn.close()
         raise ApiError(400, "Wrong password")
-    if data.password is not None:
-        conn.execute("UPDATE users SET email=?, password_hash=? WHERE id=?",
-                     (new_email, h(data.password), user["id"]))
-    else:
-        conn.execute("UPDATE users SET email=? WHERE id=?", (new_email, user["id"]))
-    conn.commit()
+    taken = conn.execute("SELECT id FROM users WHERE LOWER(email)=? AND id<>?",
+                         (new_email, user["id"])).fetchone()
+    if taken:
+        conn.close()
+        raise ApiError(400, "That email is already in use")
+    try:
+        if data.password is not None:
+            conn.execute("UPDATE users SET email=?, password_hash=? WHERE id=?",
+                         (new_email, h(data.password), user["id"]))
+        else:
+            conn.execute("UPDATE users SET email=? WHERE id=?", (new_email, user["id"]))
+        conn.commit()
+    except Exception:
+        conn.rollback(); conn.close()
+        raise ApiError(400, "That email is already in use")
     conn.close()
+    audit("change_email", user["email"], new_email)
     return {"ok": True}
 
 @app.get("/api/user/rank")
@@ -2669,30 +2697,154 @@ def password_reset(data: ResetIn):
     conn.commit(); conn.close()
     return {"ok": True}
 
-@app.get("/api/telegram/daily-rewards/link-code")
-def tg_code(user: dict = Depends(get_current_user)):
+# ================= TELEGRAM ACCOUNT LINKING =================
+LINK_CODE_TTL = 900  # one-time code validity, seconds
+
+def tg_api(method: str, payload: Optional[dict] = None, timeout: int = 15):
+    """Call the Telegram Bot API. Returns parsed JSON, or None on failure."""
+    if not TG_BOT:
+        return None
+    import urllib.request
+    url = f"https://api.telegram.org/bot{TG_BOT}/{method}"
+    data = json.dumps(payload or {}).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode() or "{}")
+    except Exception as e:
+        audit("telegram_api_error", method, str(e))
+        return None
+
+def tg_send(chat_id, text: str):
+    return tg_api("sendMessage", {"chat_id": chat_id, "text": text,
+                                  "disable_web_page_preview": True})
+
+def _tg_link_user(chat_id, from_user, code: str):
+    """Handle ``/link CODE`` from a private chat: verify the code and link."""
+    first = (from_user.get("first_name") or "").strip()
+    last = (from_user.get("last_name") or "").strip()
+    handle = from_user.get("username") or ""
+    tg_uid = str(from_user.get("id") or "")
+    name_ok = "phantomcardz" in (first + last).lower().replace(" ", "") \
+        or "phantomcardz" in (handle or "").lower()
+    if not name_ok:
+        tg_send(chat_id, "Please add “PhantomCardz” to your Telegram first or last name "
+                         "(or username), then send the command again.")
+        return
     conn = db()
-    r = conn.execute("SELECT * FROM telegram_claims WHERE user_id=?", (user["id"],)).fetchone()
-    today = time.strftime("%Y-%m-%d")
-    claimed = bool(r and time.strftime("%Y-%m-%d", time.localtime(r["last_claim"])) == today)
+    row = conn.execute("SELECT * FROM telegram_link_codes WHERE code=?", (code,)).fetchone()
+    if not row or row["used"]:
+        conn.close()
+        tg_send(chat_id, "That code is invalid or already used. Generate a new one on your "
+                         "Account page at phantomcardz.cc/account.")
+        return
+    if now() - int(row["created_at"] or 0) > LINK_CODE_TTL:
+        conn.close()
+        tg_send(chat_id, "That code has expired. Generate a fresh one on your Account page.")
+        return
+    taken = conn.execute("SELECT id FROM users WHERE telegram_id=? AND id<>?",
+                         (tg_uid, row["user_id"])).fetchone()
+    if taken:
+        conn.close()
+        tg_send(chat_id, "This Telegram account is already linked to another PhantomCardz account.")
+        return
+    conn.execute("UPDATE users SET telegram=?, telegram_id=? WHERE id=?",
+                 (handle or first or "linked", tg_uid, row["user_id"]))
+    conn.execute("UPDATE telegram_link_codes SET used=1 WHERE code=?", (code,))
+    conn.commit()
+    uname = conn.execute("SELECT username FROM users WHERE id=?", (row["user_id"],)).fetchone()
     conn.close()
-    return {"code": "TG-" + secrets.token_hex(3).upper(), "reward": 0.5, "claimed": claimed}
+    linked_as = uname["username"] if uname else "your account"
+    tg_send(chat_id, f"✅ Linked! This Telegram account is now connected to PhantomCardz ({linked_as}). "
+                     "Eligible reward payouts will be sent here.")
+    audit("telegram_link", handle or tg_uid, f"user_id={row['user_id']}")
+
+def process_telegram_update(update: dict):
+    """Handle a single Telegram update (only ``/link`` and ``/start`` matter)."""
+    msg = update.get("message") or update.get("edited_message")
+    if not msg:
+        return
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+    if not chat_id or not text:
+        return
+    low = text.lower()
+    if chat.get("type") != "private":
+        if low.startswith("/link"):
+            tg_send(chat_id, "For your security, send /link CODE to me in a private chat.")
+        return
+    parts = text.split()
+    if low.startswith("/link"):
+        code = parts[1].strip().upper() if len(parts) > 1 else ""
+        if not code:
+            tg_send(chat_id, "Usage: /link CODE — generate a code on your Account page first.")
+            return
+        _tg_link_user(chat_id, msg.get("from") or {}, code)
+    elif low.startswith("/start"):
+        tg_send(chat_id, f"Welcome to {SITE}! To link your account, generate a one-time code on "
+                         "the Account page, then send /link CODE here in this private chat.")
+
+_tg_poller_started = {"flag": False}
+
+def _tg_poll_loop():
+    tg_api("deleteWebhook", {"drop_pending_updates": False})
+    offset = None
+    while True:
+        params = {"timeout": 30, "allowed_updates": json.dumps(["message", "edited_message"])}
+        if offset is not None:
+            params["offset"] = offset
+        res = tg_api("getUpdates", params, timeout=40)
+        if not (res and res.get("ok")):
+            time.sleep(3)
+            continue
+        for upd in res.get("result", []):
+            offset = upd.get("update_id", 0) + 1
+            try:
+                process_telegram_update(upd)
+            except Exception as e:
+                audit("telegram_update_error", "-", str(e))
+
+def start_telegram_poller():
+    if not TG_BOT or _tg_poller_started["flag"]:
+        return
+    _tg_poller_started["flag"] = True
+    threading.Thread(target=_tg_poll_loop, daemon=True, name="tg-poller").start()
+
+def _issue_link_code(conn, uid: int) -> str:
+    """Return the user's active one-time code, minting a fresh one if needed."""
+    row = conn.execute("SELECT code,created_at FROM telegram_link_codes "
+                       "WHERE user_id=? AND used=0 ORDER BY created_at DESC LIMIT 1",
+                       (uid,)).fetchone()
+    if row and now() - int(row["created_at"] or 0) <= LINK_CODE_TTL:
+        return row["code"]
+    conn.execute("DELETE FROM telegram_link_codes WHERE user_id=? AND used=0", (uid,))
+    code = secrets.token_hex(3).upper()
+    conn.execute("INSERT INTO telegram_link_codes(code,user_id,created_at,used) VALUES(?,?,?,0)",
+                 (code, uid, now()))
+    conn.commit()
+    return code
+
+@app.get("/api/telegram/daily-rewards/link-code")
+def tg_link_status(user: dict = Depends(get_current_user)):
+    conn = db()
+    r = conn.execute("SELECT telegram, telegram_id FROM users WHERE id=?", (user["id"],)).fetchone()
+    if r and r["telegram_id"]:
+        conn.close()
+        return {"code": "", "linked": True,
+                "telegramUsername": (r["telegram"] or "").lstrip("@") or None}
+    code = _issue_link_code(conn, user["id"])
+    conn.close()
+    return {"code": code, "linked": False, "telegramUsername": None, "expiresIn": LINK_CODE_TTL}
 
 @app.post("/api/telegram/daily-rewards/link-code")
-def tg_claim(user: dict = Depends(get_current_user)):
+@app.post("/api/telegram/link-code")
+def tg_link_code(user: dict = Depends(get_current_user)):
     conn = db()
-    today_start = int(time.mktime(time.strptime(time.strftime("%Y-%m-%d"), "%Y-%m-%d")))
-    cur = conn.execute("UPDATE telegram_claims SET last_claim=? WHERE user_id=? AND last_claim<?",
-                       (now(), user["id"], today_start))
-    if cur.rowcount == 0:
-        ex = conn.execute("SELECT 1 FROM telegram_claims WHERE user_id=?", (user["id"],)).fetchone()
-        if ex:
-            conn.close()
-            raise ApiError(400, "Already claimed today")
-        conn.execute("INSERT INTO telegram_claims(user_id,last_claim) VALUES(?,?)", (user["id"], now()))
-    conn.execute("UPDATE users SET balance=balance+0.5 WHERE id=?", (user["id"],))
-    conn.commit(); conn.close()
-    return {"claimed": True, "reward": 0.5}
+    code = _issue_link_code(conn, user["id"])
+    conn.close()
+    audit("telegram_link_code", user["email"], code)
+    return {"code": code, "expiresIn": LINK_CODE_TTL}
 
 @app.post("/api/upload")
 def upload(file: UploadFile = File(...), user: dict = Depends(get_current_user)):
