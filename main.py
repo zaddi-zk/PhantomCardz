@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PhantomCardz — cards & accounts marketplace backend (FastAPI + SQLite)."""
-import os, secrets, random, time, hashlib, string, json, threading
+import os, re, secrets, random, time, hashlib, string, json, threading
 import smtplib
 from datetime import datetime
 from email.message import EmailMessage
@@ -372,6 +372,9 @@ def ensure_schema(conn):
             conn.execute(f"ALTER TABLE tickets ADD COLUMN {_col} {_ddl}")
     if not _has_col(conn, "users", "telegram_id"):
         conn.execute("ALTER TABLE users ADD COLUMN telegram_id TEXT")
+    # Per-card free text the SPA parses for city/state/zip (and delivers to the buyer).
+    if not _has_col(conn, "cards", "extras"):
+        conn.execute("ALTER TABLE cards ADD COLUMN extras TEXT DEFAULT ''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
 MONEY_COLUMNS = [
@@ -1700,7 +1703,7 @@ def card_out(r, base_name=None, base_price=None, base_hr=None) -> dict:
         "expiry": (f"{mm:02d}/{str(yy)[-2:]}" if mm else ""),
         "cvv": r["cvv"],
         "country": "US",
-        "extras": "",
+        "extras": ((r.get("extras") if hasattr(r, "get") else None) or ""),
         "price": base_price if base_price is not None else None,
         "hrPercent": base_hr if base_hr else 80,
         "isFirstHand": True,
@@ -1743,17 +1746,48 @@ def list_cards(baseId: Optional[int] = None, user: dict = Depends(get_current_us
     return [card_out(r, r["base_name"], r["base_price"], r["base_hr"]) for r in rows]
 
 class BuyCardIn(BaseModel):
-    baseId: int
+    baseId: Optional[int] = None
+    extras: Optional[str] = None
+    price: Optional[float] = None
 
-@app.post("/api/cards")
-def buy_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
+def _parse_card_line(line: str):
+    """Parse one pasted "full item" line into card fields.
+
+    Mirrors the frozen SPA's own tokenizer (``iJ``/``aJ``): split on
+    ``[|:,\\s]+``; token 0 is the number, token 1 an ``MM/YY`` or ``MM/YYYY``
+    expiry, token 2 the CVV. Everything else is preserved verbatim in
+    ``extras`` (city/state/zip live there and are parsed client-side).
+    """
+    raw = (line or "").strip()
+    if not raw:
+        return None
+    parts = [p for p in re.split(r"[|:,\s]+", raw) if p]
+    if len(parts) < 3:
+        return None
+    number = "".join(ch for ch in parts[0] if ch.isdigit())
+    if len(number) < 12:
+        return None
+    m = re.match(r"^(\d{1,2})[/-](\d{2}|\d{4})$", parts[1])
+    if not m:
+        return None
+    month = int(m.group(1))
+    year = int(m.group(2))
+    if year < 100:
+        year += 2000
+    if not (1 <= month <= 12):
+        return None
+    cvv = "".join(ch for ch in parts[2] if ch.isdigit()) or parts[2]
+    return {"number": number, "month": month, "year": year, "cvv": cvv, "extras": raw}
+
+def _buy_card_random(base_id: int, user: dict):
+    """Legacy: buy one random unsold card from a base using wallet balance."""
     conn = db()
-    b = conn.execute("SELECT * FROM card_bases WHERE id=? AND active=1", (data.baseId,)).fetchone()
+    b = conn.execute("SELECT * FROM card_bases WHERE id=? AND active=1", (base_id,)).fetchone()
     if not b:
         conn.close()
         raise ApiError(404, "Not found")
     c = conn.execute("SELECT * FROM cards WHERE base_id=? AND sold=0 ORDER BY RANDOM() LIMIT 1",
-                     (data.baseId,)).fetchone()
+                     (base_id,)).fetchone()
     if not c:
         conn.close()
         raise ApiError(400, "Out of stock")
@@ -1780,6 +1814,45 @@ def buy_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
     out = card_out(c, b["name"], b["price"], b["hrPercent"])
     out["newBalance"] = int(round(u["balance"]))
     return out
+
+@app.post("/api/cards")
+def buy_or_add_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
+    """Add card stock (staff) or buy a random card (legacy).
+
+    The frozen SPA reuses ``POST /api/cards`` from the admin panel to add stock
+    (``{extras, price, baseId}``) while buying a specific card goes through
+    ``POST /api/cards/{id}/purchase``. Branch on the payload so both keep
+    working; the ``{baseId}``-only shape stays the legacy random buy.
+    """
+    if data.extras is not None or data.price is not None:
+        _require_staff(user)
+        if not data.baseId:
+            raise ApiError(400, "Base is required")
+        if not (data.extras or "").strip():
+            raise ApiError(400, "Full item is required")
+        conn = db()
+        b = conn.execute("SELECT id FROM card_bases WHERE id=? AND active=1", (data.baseId,)).fetchone()
+        if not b:
+            conn.close()
+            raise ApiError(404, "Base not found")
+        added = skipped = 0
+        for line in (data.extras or "").splitlines():
+            parsed = _parse_card_line(line)
+            if not parsed:
+                if line.strip():
+                    skipped += 1
+                continue
+            conn.execute("INSERT INTO cards(base_id,number,exp_month,exp_year,cvv,extras) VALUES(?,?,?,?,?,?)",
+                         (data.baseId, parsed["number"], parsed["month"], parsed["year"],
+                          parsed["cvv"], parsed["extras"]))
+            added += 1
+        conn.commit(); conn.close()
+        audit("card_add", user["email"], f"base={data.baseId} added={added} skipped={skipped}")
+        return {"ok": True, "added": added, "addedCount": added,
+                "skipped": skipped, "skippedCount": skipped}
+    if not data.baseId:
+        raise ApiError(400, "Base is required")
+    return _buy_card_random(data.baseId, user)
 
 @app.get("/api/user/cards")
 def my_cards(user: dict = Depends(get_current_user)):
