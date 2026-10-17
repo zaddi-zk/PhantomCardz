@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """PhantomCardz — cards & accounts marketplace backend (FastAPI + SQLite)."""
-import os, re, secrets, random, time, hashlib, string, json, threading
+import os, re, secrets, random, time, hashlib, string, json, threading, math
 import smtplib
 from datetime import datetime
 from email.message import EmailMessage
@@ -128,6 +128,80 @@ def to_cents(v) -> int:
     except (TypeError, ValueError):
         return 0
 
+# ---- money / price guards -------------------------------------------------
+# Every monetary value the application stores (balances, order totals, variant
+# prices, deposit amounts) is an integer number of cents.  These helpers are the
+# single choke point that validates untrusted input before it reaches the DB, so
+# a negative / NaN / infinity / absurd value can never be persisted or charged.
+MAX_MONEY_CENTS = 100_000_000  # $1,000,000.00 — sanity ceiling for one unit/order
+
+def _money(v, *, dollars: bool = False) -> int:
+    """Validate a money value -> non-negative int cents.
+
+    ``dollars=True`` treats the input as dollars (the SPA's admin forms) and
+    scales by 100; otherwise it is already in cents.  Rejects ``None``, NaN,
+    +/-inf, negative and oversized values so prices/totals can never be weird.
+    """
+    if isinstance(v, bool) or v is None:
+        raise ApiError(400, "Invalid amount")
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        raise ApiError(400, "Invalid amount")
+    if not math.isfinite(f) or f < 0:
+        raise ApiError(400, "Invalid amount")
+    n = int(round(f * 100)) if dollars else int(round(f))
+    if n > MAX_MONEY_CENTS:
+        raise ApiError(400, "Amount is too large")
+    return n
+
+def _safe_cents(v) -> int:
+    """Clamp an already-stored money value to a non-negative int (0 on junk)."""
+    try:
+        n = int(round(float(v)))
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+def _price_cents(row) -> int:
+    """Read a stored price (cents) from a variant/card row, clamped to >= 0."""
+    if row is None or "price" not in row:
+        return 0
+    return _safe_cents(row["price"])
+
+def _discount_off_cents(total_cents: int, d) -> int:
+    """Integer cents taken off ``total_cents`` for discount row ``d``.
+
+    Never returns more than ``total_cents`` and never a negative number, so a
+    discount can reduce an order to $0.00 but can never invert it into a credit.
+    """
+    if d is None:
+        return 0
+    total_cents = max(0, int(total_cents))
+    if (d.get("type") or "percent") == "fixed":
+        off = _money(d.get("value"))
+    else:
+        try:
+            pct = float(d.get("percent") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        pct = min(100.0, max(0.0, pct))
+        off = int(round(total_cents * pct / 100.0))
+    return min(total_cents, max(0, off))
+
+def _apply_discount(total_cents: int, disc):
+    """Return (total_after_cents, applied_discount) honouring min_order.
+
+    ``applied_discount`` is the row when the discount was actually used (so the
+    caller can bump its usage counter) or ``None`` when it did not apply.
+    """
+    if disc is None:
+        return total_cents, None
+    min_order = _money(disc.get("min_order"))
+    if total_cents < min_order:
+        return total_cents, None
+    return max(0, total_cents - _discount_off_cents(total_cents, disc)), disc
+
 def rand_str(n: int = 8) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
@@ -148,6 +222,32 @@ def _rl_hit(key: str, limit: int, window: int) -> bool:
 def audit(event: str, actor: str = "-", detail: str = ""):
     with open(os.path.join(LOGS, "audit.log"), "a") as f:
         f.write(f"{now()} | {event} | {actor} | {detail}\n")
+
+def _idem_begin(conn, key: str, user_id: int):
+    """Reserve an idempotency key for this request.
+
+    Returns the cached response dict when this key already ran (safe replay),
+    ``None`` when the caller owns the key, or raises 409 when an identical
+    request is still in flight.  The reservation row is written inside the
+    caller's transaction, so a failed attempt is rolled back and can be retried.
+    """
+    row = conn.execute("SELECT response FROM idempotency WHERE key=? AND user_id=?",
+                       (key, user_id)).fetchone()
+    if row is not None:
+        try:
+            return json.loads(row["response"] or "null")
+        except Exception:
+            return {}
+    ins = conn.execute("INSERT INTO idempotency(key,user_id,response,created_at) VALUES(?,?,?,?) "
+                       "ON CONFLICT(key) DO NOTHING", (key, user_id, "", now()))
+    if ins.rowcount != 1:
+        raise ApiError(409, "Request already in progress")
+    return None
+
+def _idem_store(conn, key: str, user_id: int, payload):
+    """Record the response for an idempotency key (called before commit)."""
+    conn.execute("UPDATE idempotency SET response=? WHERE key=? AND user_id=?",
+                 (json.dumps(payload), key, user_id))
 
 def _tg_id_list(raw: str):
     """Parse a comma/semicolon separated list of Telegram chat IDs."""
@@ -326,6 +426,12 @@ CREATE TABLE IF NOT EXISTS telegram_link_codes(
     user_id INTEGER NOT NULL,
     created_at INTEGER,
     used INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS idempotency(
+    key TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    response TEXT,
+    created_at INTEGER
 );
 """
 
@@ -1042,19 +1148,14 @@ def discount_out(r) -> dict:
         "expiresAt": ts(expires) if expires else None,
     }
 
-def _discount_off(total: float, d) -> float:
-    """Return the money (cents) taken off ``total`` for discount row ``d``."""
-    if d is None:
-        return 0.0
-    if (d.get("type") or "percent") == "fixed":
-        return min(float(total), float(d.get("value") or 0))
-    return float(total) * float(d.get("percent") or 0) / 100.0
-
 def _active_discount(conn, code=None, discount_id=None):
     if discount_id:
         d = conn.execute("SELECT * FROM discount_codes WHERE id=? AND active=1", (discount_id,)).fetchone()
     elif code:
-        d = conn.execute("SELECT * FROM discount_codes WHERE code=? AND active=1", (code,)).fetchone()
+        # Codes are stored upper-cased; accept any case (and stray whitespace)
+        # so a customer typing "save20" still matches the "SAVE20" code.
+        d = conn.execute("SELECT * FROM discount_codes WHERE code=? AND active=1",
+                         (str(code).strip().upper(),)).fetchone()
     else:
         d = None
     if not d:
@@ -1108,7 +1209,7 @@ class OrderIn(BaseModel):
     discountCodeId: Optional[int] = None
 
 @app.post("/api/orders")
-def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
+def place_order(data: OrderIn, request: Request, user: dict = Depends(get_current_user)):
     """Instant balance checkout: debit the wallet, release the products.
 
     Accepts both the legacy ``{variantId, quantity}`` shape and the SPA's
@@ -1128,9 +1229,15 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
     card_ids = [int(c) for c in (data.cardIds or [])]
     if not raw_items and not card_ids:
         raise ApiError(400, "Invalid order")
+    idem = (request.headers.get("Idempotency-Key") or "").strip() or None
     conn = db()
     try:
-        total = 0.0
+        if idem:
+            cached = _idem_begin(conn, idem, user["id"])
+            if cached is not None:
+                conn.close()
+                return cached
+        total = 0  # integer cents for the whole order
         reserved = []
         for vid, qty in raw_items:
             if qty < 1 or vid <= 0:
@@ -1138,29 +1245,41 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
             v = conn.execute("SELECT * FROM variants WHERE id=?", (vid,)).fetchone()
             if not v:
                 raise ApiError(404, "Variant not found")
+            min_q = int(v["minQuantity"] or 1)
+            if qty < min_q:
+                raise ApiError(400, f"Minimum order is {min_q}")
             q = "SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?"
             if conn.is_postgres:
                 q += " FOR UPDATE SKIP LOCKED"
             rows = conn.execute(q, (v["id"], qty)).fetchall()
             if len(rows) < qty:
                 raise ApiError(400, "Insufficient stock")
-            total += float(v["price"]) * qty
+            total += _price_cents(v) * qty
             reserved.append((v, qty, rows))
-        card_rows = []
+        # De-duplicate card ids so the same card can never be billed twice in
+        # one order (the guarded UPDATE below would otherwise fail mid-way).
+        seen_cards, unique_card_ids = set(), []
         for cid in card_ids:
+            if cid not in seen_cards:
+                seen_cards.add(cid)
+                unique_card_ids.append(cid)
+        card_rows = []
+        for cid in unique_card_ids:
             c = conn.execute("SELECT ca.*, cb.name AS base_name, cb.price AS base_price, cb.hrPercent AS base_hr "
                              "FROM cards ca JOIN card_bases cb ON cb.id=ca.base_id "
                              "WHERE ca.id=? AND ca.sold=0 AND cb.active=1", (cid,)).fetchone()
             if not c:
                 raise ApiError(400, "Card out of stock")
-            total += float(c["base_price"])
-            card_rows.append(c)
+            card_price = c.get("price")
+            charge = _money(card_price) if card_price is not None else _money(c["base_price"])
+            total += charge
+            card_rows.append((c, charge))
+        # Apply the discount capped at the order total: a code can make an order
+        # free but can never turn it into a payout/credit.
         disc = _active_discount(conn, code=data.code, discount_id=data.discountCodeId)
-        if disc:
-            total -= _discount_off(total, disc)
-        total = round(total, 2)
-        if disc:
-            conn.execute("UPDATE discount_codes SET used_count=COALESCE(used_count,0)+1 WHERE id=?", (disc["id"],))
+        total, applied = _apply_discount(total, disc)
+        if applied:
+            conn.execute("UPDATE discount_codes SET used_count=COALESCE(used_count,0)+1 WHERE id=?", (applied["id"],))
         # Debit first, guarded by balance>=total, so the wallet can't go negative.
         cur = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
                            (total, user["id"], total))
@@ -1184,16 +1303,20 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
             piece = [s["content"] for s in picked]
             items.extend(piece)
             conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents,item_type) VALUES(?,?,?,?,?,?)",
-                         (oid, v["id"], qty, v["price"], json.dumps(piece), "product"))
-        for c in card_rows:
+                         (oid, v["id"], qty, _price_cents(v), json.dumps(piece), "product"))
+        for c, charge in card_rows:
             c2 = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0", (user["id"], c["id"]))
             if c2.rowcount != 1:
                 raise ApiError(400, "Card just sold, try again")
             items.append(c["number"])
             conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents,item_type,card_id) VALUES(?,?,?,?,?,?,?)",
-                         (oid, None, 1, c["base_price"], json.dumps([c["number"]]), "card", c["id"]))
+                         (oid, None, 1, charge, json.dumps([c["number"]]), "card", c["id"]))
         conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps(items), oid))
         u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+        result = {"id": oid, "items": items, "total": total,
+                  "newBalance": int(round(u["balance"])), "status": "completed"}
+        if idem:
+            _idem_store(conn, idem, user["id"], result)
         conn.commit()
     except ApiError:
         conn.rollback(); conn.close(); raise
@@ -1201,8 +1324,7 @@ def place_order(data: OrderIn, user: dict = Depends(get_current_user)):
         conn.rollback(); conn.close(); raise
     conn.close()
     tg_notify(f"[{SITE}] ORDER #{oid} by {user['email']}: {qty_total or len(card_rows)} item(s) = ${total / 100:.2f}")
-    return {"id": oid, "items": items, "total": total,
-            "newBalance": int(round(u["balance"])), "status": "completed"}
+    return result
 
 @app.get("/api/orders")
 def my_orders(user: dict = Depends(get_current_user)):
@@ -1325,27 +1447,28 @@ def _cart_order(conn, items, user, discount_id=None, payment_method="", payment_
 
     Returns (order_id, total_cents, delivered_contents)."""
     reserved = []
-    total = 0.0
+    total = 0  # integer cents
     for it in items:
         if it.quantity < 1:
             raise ApiError(400, "Invalid quantity")
         v = conn.execute("SELECT * FROM variants WHERE id=?", (it.variantId,)).fetchone()
         if not v:
             raise ApiError(404, "Variant not found")
+        min_q = int(v["minQuantity"] or 1)
+        if it.quantity < min_q:
+            raise ApiError(400, f"Minimum order is {min_q}")
         q = "SELECT * FROM stock_items WHERE variant_id=? AND sold=0 LIMIT ?"
         if conn.is_postgres:
             q += " FOR UPDATE SKIP LOCKED"
         rows = conn.execute(q, (v["id"], it.quantity)).fetchall()
         if len(rows) < it.quantity:
             raise ApiError(400, "Insufficient stock")
-        total += float(v["price"]) * it.quantity
+        total += _price_cents(v) * it.quantity
         reserved.append((v, it.quantity, rows))
     disc = _active_discount(conn, discount_id=discount_id)
-    if disc:
-        total -= _discount_off(total, disc)
-    total = round(total, 2)
-    if disc:
-        conn.execute("UPDATE discount_codes SET used_count=COALESCE(used_count,0)+1 WHERE id=?", (disc["id"],))
+    total, applied = _apply_discount(total, disc)
+    if applied:
+        conn.execute("UPDATE discount_codes SET used_count=COALESCE(used_count,0)+1 WHERE id=?", (applied["id"],))
     first_vid = reserved[0][0]["id"] if reserved else None
     qty_total = sum(q for _, q, _ in reserved)
     oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,payment_note,created_at) "
@@ -1366,7 +1489,7 @@ def _cart_order(conn, items, user, discount_id=None, payment_method="", payment_
         piece = [s["content"] for s in picked]
         contents.extend(piece)
         conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents) VALUES(?,?,?,?,?)",
-                     (oid, v["id"], qty, v["price"], json.dumps(piece)))
+                     (oid, v["id"], qty, _price_cents(v), json.dumps(piece)))
     conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps(contents), oid))
     return oid, total, contents
 
@@ -1831,7 +1954,7 @@ def _buy_card_random(base_id: int, user: dict):
     if not c:
         conn.close()
         raise ApiError(400, "Out of stock")
-    charge = c["price"] if c.get("price") is not None else b["price"]
+    charge = _money(c["price"]) if c.get("price") is not None else _price_cents(b)
     cur = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0",
                        (user["id"], c["id"]))
     if cur.rowcount != 1:
@@ -1872,7 +1995,7 @@ def buy_or_add_card(data: BuyCardIn, user: dict = Depends(get_current_user)):
         if not (data.extras or "").strip():
             raise ApiError(400, "Full item is required")
         # The admin form sends the price in dollars; money is stored in cents.
-        price_cents = int(round(data.price * 100)) if (data.price is not None and data.price > 0) else None
+        price_cents = _money(data.price, dollars=True) if (data.price is not None and data.price > 0) else None
         refundable = (1 if data.refundable else 0) if data.refundable is not None else None
         conn = db()
         b = conn.execute("SELECT id FROM card_bases WHERE id=? AND active=1", (data.baseId,)).fetchone()
@@ -2437,7 +2560,7 @@ def admin_add_variant(pid: int, data: VariantIn, user: dict = Depends(get_curren
     require_admin(user)
     conn = db()
     vid = insert_id(conn, "INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,1,?)",
-                    (pid, data.name, data.price, now()))
+                    (pid, data.name, _money(data.price), now()))
     conn.commit(); conn.close()
     return {"id": vid, "ok": True}
 
@@ -2561,19 +2684,41 @@ def _parse_dt(v) -> Optional[int]:
 @app.post("/api/admin/discount-codes")
 def admin_add_discount(data: DiscountCodeIn, user: dict = Depends(get_current_user)):
     require_admin(user)
-    conn = db()
+    code = (data.code or "").strip().upper()
+    if not code:
+        raise ApiError(400, "Code is required")
     dtype = (data.type or "percent").lower()
-    if data.value is not None:
-        value = float(data.value)
-    elif data.percent is not None:
-        value = float(data.percent)
+    if dtype not in ("percent", "fixed"):
+        raise ApiError(400, "Invalid discount type")
+    raw = data.value if data.value not in (None, "") else data.percent
+    if raw in (None, ""):
+        raw = 0
+    if dtype == "percent":
+        try:
+            pct = float(raw)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Invalid discount value")
+        if not math.isfinite(pct) or pct < 0 or pct > 100:
+            raise ApiError(400, "Percent discount must be between 0 and 100")
+        value = pct
+        percent = int(round(pct))
     else:
-        value = 0.0
-    percent = int(value) if dtype == "percent" else (data.percent or 0)
+        # Fixed discounts are entered in dollars; stored (and capped) in cents.
+        value = _money(raw, dollars=True)
+        percent = 0
+    min_order = _money(data.minOrder or 0, dollars=True)
+    max_uses = None
+    if data.maxUses is not None:
+        try:
+            max_uses = int(data.maxUses)
+        except (TypeError, ValueError):
+            raise ApiError(400, "Invalid max uses")
+        if max_uses < 1:
+            raise ApiError(400, "Invalid max uses")
+    conn = db()
     conn.execute("INSERT INTO discount_codes(code,percent,type,value,min_order,max_uses,used_count,expires_at,active) "
                  "VALUES(?,?,?,?,?,?,0,?,1) ON CONFLICT(code) DO NOTHING",
-                 (data.code.upper(), percent, dtype, value, float(data.minOrder or 0),
-                  data.maxUses, _parse_dt(data.expiresAt)))
+                 (code, percent, dtype, value, min_order, max_uses, _parse_dt(data.expiresAt)))
     conn.commit(); conn.close()
     return {"ok": True, "type": dtype, "value": value}
 
@@ -3663,7 +3808,7 @@ def admin_add_base(data: CardBaseIn, user: dict = Depends(get_current_user)):
         raise ApiError(400, "Base name is required")
     conn = db()
     bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,?)",
-                    (name, data.price, 1 if data.refundable else 0, data.hrPercent))
+                    (name, _money(data.price), 1 if data.refundable else 0, data.hrPercent))
     conn.commit()
     conn.close()
     return {"ok": True, "id": bid}
@@ -3675,7 +3820,7 @@ def admin_patch_base(bid: int, payload: Dict[str, Any], user: dict = Depends(get
     if "name" in payload:
         conn.execute("UPDATE card_bases SET name=? WHERE id=?", (payload["name"], bid))
     if "price" in payload:
-        conn.execute("UPDATE card_bases SET price=? WHERE id=?", (payload["price"], bid))
+        conn.execute("UPDATE card_bases SET price=? WHERE id=?", (_money(payload["price"]), bid))
     if "active" in payload:
         conn.execute("UPDATE card_bases SET active=? WHERE id=?", (1 if payload["active"] else 0, bid))
     if "refundable" in payload:
@@ -3720,9 +3865,13 @@ def admin_patch_variant(vid: int, payload: Dict[str, Any], user: dict = Depends(
     if "name" in payload:
         conn.execute("UPDATE variants SET name=? WHERE id=?", (payload["name"], vid))
     if "price" in payload:
-        conn.execute("UPDATE variants SET price=? WHERE id=?", (payload["price"], vid))
+        conn.execute("UPDATE variants SET price=? WHERE id=?", (_money(payload["price"]), vid))
     if "minQuantity" in payload:
-        conn.execute("UPDATE variants SET minQuantity=? WHERE id=?", (payload["minQuantity"], vid))
+        try:
+            mq = max(1, int(payload["minQuantity"] or 1))
+        except (TypeError, ValueError):
+            mq = 1
+        conn.execute("UPDATE variants SET minQuantity=? WHERE id=?", (mq, vid))
     conn.commit()
     conn.close()
     return {"ok": True}
@@ -3911,7 +4060,7 @@ def create_variant(data: NewVariantIn, user: dict = Depends(get_current_user)):
         conn.close()
         raise ApiError(404, "Product not found")
     vid = insert_id(conn, "INSERT INTO variants(productId,name,price,comparePrice,minQuantity,created_at) VALUES(?,?,?,NULL,?,?)",
-                    (data.productId, data.name, data.price, data.minQuantity, now()))
+                    (data.productId, data.name, _money(data.price), data.minQuantity, now()))
     conn.commit(); conn.close()
     return {"id": vid, "ok": True}
 
@@ -3928,7 +4077,7 @@ def worker_add_base(data: WorkerBaseIn, user: dict = Depends(get_current_user)):
         raise ApiError(400, "Base name is required")
     conn = db()
     bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,80)",
-                    (name, data.price, 1 if data.refundable else 0))
+                    (name, _money(data.price), 1 if data.refundable else 0))
     conn.commit(); conn.close()
     return {"id": bid, "ok": True}
 
@@ -3937,35 +4086,46 @@ class PurchaseCardIn(BaseModel):
     quantity: int = 1
 
 @app.post("/api/cards/{cid}/purchase")
-def purchase_card(cid: int, data: Optional[PurchaseCardIn] = None, user: dict = Depends(get_current_user)):
+def purchase_card(cid: int, request: Request, data: Optional[PurchaseCardIn] = None, user: dict = Depends(get_current_user)):
     conn = db()
-    c = conn.execute("SELECT ca.*, cb.price AS base_price, cb.name AS base_name, cb.hrPercent AS base_hr "
-                     "FROM cards ca JOIN card_bases cb ON cb.id=ca.base_id "
-                     "WHERE ca.id=? AND ca.sold=0 AND cb.active=1", (cid,)).fetchone()
-    if not c:
-        conn.close()
-        raise ApiError(400, "Out of stock")
-    charge = c["price"] if c.get("price") is not None else c["base_price"]
-    cur = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0", (user["id"], cid))
-    if cur.rowcount != 1:
-        conn.rollback(); conn.close()
-        raise ApiError(400, "Card just sold, try again")
-    cur2 = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
-                        (charge, user["id"], charge))
-    if cur2.rowcount != 1:
-        conn.rollback(); conn.close()
-        raise ApiError(400, "Not enough funds. Top up your account to complete this purchase.", "insufficient_funds")
-    oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,paid_amount,created_at) "
-                          "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (user["id"], None, 1, charge, "completed", "[]", "Balance", charge, now()))
-    conn.execute("UPDATE orders SET order_id=? WHERE id=?", (f"CARD-{oid}", oid))
-    conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents,item_type,card_id) VALUES(?,?,?,?,?,?,?)",
-                 (oid, None, 1, charge, json.dumps([c["number"]]), "card", cid))
-    conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
-    u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
-    conn.commit(); conn.close()
-    out = card_out(c, c["base_name"], c["base_price"], c["base_hr"])
-    out["newBalance"] = int(round(u["balance"]))
+    idem = (request.headers.get("Idempotency-Key") or "").strip() or None
+    try:
+        if idem:
+            cached = _idem_begin(conn, idem, user["id"])
+            if cached is not None:
+                conn.close()
+                return cached
+        c = conn.execute("SELECT ca.*, cb.price AS base_price, cb.name AS base_name, cb.hrPercent AS base_hr "
+                         "FROM cards ca JOIN card_bases cb ON cb.id=ca.base_id "
+                         "WHERE ca.id=? AND ca.sold=0 AND cb.active=1", (cid,)).fetchone()
+        if not c:
+            raise ApiError(400, "Out of stock")
+        charge = _money(c["price"]) if c.get("price") is not None else _safe_cents(c["base_price"])
+        cur = conn.execute("UPDATE cards SET sold=1, buyer_id=? WHERE id=? AND sold=0", (user["id"], cid))
+        if cur.rowcount != 1:
+            raise ApiError(400, "Card just sold, try again")
+        cur2 = conn.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                            (charge, user["id"], charge))
+        if cur2.rowcount != 1:
+            raise ApiError(400, "Not enough funds. Top up your account to complete this purchase.", "insufficient_funds")
+        oid = insert_id(conn, "INSERT INTO orders(user_id,variant_id,quantity,total,status,items,payment_method,paid_amount,created_at) "
+                              "VALUES(?,?,?,?,?,?,?,?,?)",
+                        (user["id"], None, 1, charge, "completed", "[]", "Balance", charge, now()))
+        conn.execute("UPDATE orders SET order_id=? WHERE id=?", (f"CARD-{oid}", oid))
+        conn.execute("INSERT INTO order_items(order_id,variant_id,quantity,price,contents,item_type,card_id) VALUES(?,?,?,?,?,?,?)",
+                     (oid, None, 1, charge, json.dumps([c["number"]]), "card", cid))
+        conn.execute("UPDATE orders SET items=? WHERE id=?", (json.dumps([c["number"]]), oid))
+        u = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()
+        out = card_out(c, c["base_name"], c["base_price"], c["base_hr"])
+        out["newBalance"] = int(round(u["balance"]))
+        if idem:
+            _idem_store(conn, idem, user["id"], out)
+        conn.commit()
+    except ApiError:
+        conn.rollback(); conn.close(); raise
+    except Exception:
+        conn.rollback(); conn.close(); raise
+    conn.close()
     return out
 
 @app.get("/api/admin/card-bases/{bid}/cards")
@@ -4081,12 +4241,24 @@ def admin_order_mark_unpaid(oid: int, payload: Dict[str, Any], user: dict = Depe
 def admin_order_refund(oid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db(); o = _admin_order(conn, oid)
-    conn.execute("UPDATE stock_items SET sold=0, order_id=NULL WHERE order_id=?", (oid,))
-    conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (o["total"], o["user_id"]))
+    # Refund exactly once: never re-credit an order that is already refunded/
+    # cancelled (double-click or retry would otherwise mint wallet balance).
+    if _order_status(o["status"]) in ("refunded",):
+        conn.close()
+        raise ApiError(400, "Order is already refunded")
+    refund = _safe_cents(o["total"])
+    # Re-arm digital stock only for un-delivered product orders; a delivered
+    # card/log must not be re-sold after the buyer has already seen it.
+    has_cards = conn.execute("SELECT 1 FROM order_items WHERE order_id=? AND item_type='card' LIMIT 1",
+                             (oid,)).fetchone()
+    if not has_cards:
+        conn.execute("UPDATE stock_items SET sold=0, order_id=NULL WHERE order_id=?", (oid,))
+    if refund > 0:
+        conn.execute("UPDATE users SET balance=balance+? WHERE id=?", (refund, o["user_id"]))
     conn.execute("UPDATE orders SET status='refunded' WHERE id=?", (oid,))
     conn.commit(); conn.close()
-    audit("order_refund", user["email"], f"id={oid} amount={o['total']}")
-    return {"ok": True, "status": "refunded", "refunded": o["total"]}
+    audit("order_refund", user["email"], f"id={oid} amount={refund}")
+    return {"ok": True, "status": "refunded", "refunded": refund}
 
 @app.post("/api/admin/orders/{oid}/replace")
 def admin_order_replace(oid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
