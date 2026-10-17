@@ -99,8 +99,13 @@
           var url = typeof input === "string" ? input : input.url;
           var method = ((init && init.method) || (input && input.method) || "GET").toUpperCase();
           return originalFetch.apply(this, arguments).then(function (response) {
-            if (method === "POST" && new URL(url, window.location.href).pathname === "/api/logout" && response.ok) {
-              window.dispatchEvent(new Event("phantomcardz:logout-complete"));
+            if (method === "POST" && response.ok) {
+              var path = new URL(url, window.location.href).pathname;
+              if (path === "/api/register") {
+                window.dispatchEvent(new Event("phantomcardz:signup-complete"));
+              } else if (path === "/api/logout") {
+                window.dispatchEvent(new Event("phantomcardz:logout-complete"));
+              }
             }
             return response;
           });
