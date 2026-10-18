@@ -3461,7 +3461,7 @@ def admin_sellers(user: dict = Depends(get_current_user)):
         "LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC").fetchall()
     accounts = conn.execute(
         "SELECT s.*, u.email, u.username, u.rank FROM sellers s "
-        "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.id DESC").fetchall() \
+        "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.user_id DESC").fetchall() \
         if _has_col(conn, "sellers", "user_id") else []
     out_accounts = []
     for s in accounts:
@@ -3475,6 +3475,83 @@ def admin_sellers(user: dict = Depends(get_current_user)):
                               "telegram": a["telegram"], "motivation": a["motivation"],
                               "status": a["status"], "createdAt": ts(a["created_at"])} for a in apps],
             "sellers": out_accounts}
+
+@app.get("/api/admin/sellers/{uid}")
+def admin_seller_detail(uid: int, user: dict = Depends(get_current_user)):
+    """Full drill-down for one seller: account, balances, listings, stock,
+    card bases, sales ledger and payouts."""
+    require_admin(user)
+    conn = db()
+    _reconcile_earnings(conn)
+    conn.commit()
+    u = conn.execute("SELECT id, email, username, rank, balance, telegram, created_at "
+                     "FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        conn.close()
+        raise ApiError(404, "User not found")
+    s = conn.execute("SELECT * FROM sellers WHERE user_id=?", (uid,)).fetchone() \
+        if _has_col(conn, "sellers", "user_id") else None
+    hold = _payout_hold_seconds(conn)
+    prods = conn.execute(
+        "SELECT id, name, description, status, created_at FROM products "
+        "WHERE owner_id=? ORDER BY id DESC", (uid,)).fetchall()
+    products = []
+    for p in prods:
+        vs = conn.execute(
+            "SELECT v.id, v.name, v.price, "
+            "(SELECT COUNT(*) FROM stock_items si WHERE si.variant_id=v.id AND si.sold=0) AS stock_count, "
+            "(SELECT COUNT(*) FROM stock_items si WHERE si.variant_id=v.id AND si.sold=1) AS sold_count "
+            "FROM variants v WHERE v.productId=? ORDER BY v.id", (p["id"],)).fetchall()
+        products.append({"id": p["id"], "name": p["name"], "description": p["description"],
+                         "status": p["status"] or "active", "createdAt": ts(p["created_at"]),
+                         "variants": [{"id": v["id"], "name": v["name"], "priceCents": _safe_cents(v["price"]),
+                                       "stockCount": v["stock_count"], "soldCount": v["sold_count"]} for v in vs]})
+    baserows = conn.execute(
+        "SELECT b.*, "
+        "(SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count, "
+        "(SELECT COUNT(*) FROM cards c2 WHERE c2.base_id=b.id AND c2.sold=1) AS sold_count "
+        "FROM card_bases b WHERE b.owner_id=? ORDER BY b.id DESC", (uid,)).fetchall()
+    card_bases = [{"id": b["id"], "name": b["name"], "priceCents": _safe_cents(b["price"]),
+                   "active": bool(b["active"]), "refundable": bool(b["refundable"]),
+                   "stockCount": b["stock_count"], "soldCount": b["sold_count"]} for b in baserows]
+    rows = conn.execute(
+        "SELECT l.*, o.created_at AS order_created, o.status AS order_status, "
+        "COALESCE(v.name, cb.name) AS item_name, bu.email AS buyer "
+        "FROM seller_ledger l "
+        "LEFT JOIN orders o ON o.id=l.order_id "
+        "LEFT JOIN stock_items s ON (l.item_type='stock' AND s.id=l.ref_id) "
+        "LEFT JOIN variants v ON v.id=s.variant_id "
+        "LEFT JOIN cards ca ON (l.item_type='card' AND ca.id=l.ref_id) "
+        "LEFT JOIN card_bases cb ON cb.id=ca.base_id "
+        "LEFT JOIN users bu ON bu.id=o.user_id "
+        "WHERE l.seller_id=? ORDER BY l.id DESC LIMIT 500", (uid,)).fetchall()
+    sales = [{"id": r["id"], "orderId": r["order_id"], "itemType": r["item_type"],
+              "refId": r["ref_id"], "itemName": r["item_name"], "quantity": r["quantity"],
+              "grossCents": r["gross_cents"], "feeCents": r["fee_cents"], "netCents": r["net_cents"],
+              "status": r["status"], "availableAt": ts(int(r["available_at"] or 0) + hold),
+              "createdAt": ts(r["created_at"]), "buyer": r["buyer"], "orderStatus": r["order_status"]}
+             for r in rows]
+    prows = conn.execute("SELECT * FROM payouts WHERE seller_id=? ORDER BY id DESC LIMIT 200",
+                         (uid,)).fetchall()
+    payouts = [{"id": p["id"], "amountCents": p["amount_cents"], "method": p["method"],
+                "destination": p["destination"], "status": p["status"], "note": p["note"],
+                "createdAt": ts(p["created_at"]), "paidAt": ts(p["paid_at"])} for p in prows]
+    bal = _seller_balances(conn, uid)
+    bps = _commission_bps(conn, uid)
+    conn.close()
+    return {
+        "user": {"id": u["id"], "email": u["email"], "username": u["username"], "rank": u["rank"],
+                 "balanceCents": _safe_cents(u["balance"]), "telegram": u["telegram"],
+                 "createdAt": ts(u["created_at"])},
+        "account": ({"status": s["status"], "sellerCode": s["seller_code"],
+                     "commissionBps": s["commission_bps"], "approvedAt": ts(s["approved_at"])} if s else None),
+        "commissionBps": bps,
+        "holdHours": hold // 3600,
+        "balances": bal,
+        "products": products, "cardBases": card_bases, "sales": sales, "payouts": payouts,
+        "totals": {"productCount": len(products), "baseCount": len(card_bases),
+                   "saleCount": len(sales), "payoutCount": len(payouts)},
+    }
 
 class SellerDecisionIn(BaseModel):
     commissionBps: Optional[int] = None
