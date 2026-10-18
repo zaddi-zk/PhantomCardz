@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>All Cards · PhantomCardz Admin</title>
+<style>
+  :root{--bg:#0a0a0b;--panel:#141416;--panel2:#1b1b1f;--line:#26262c;--txt:#e7e7ea;--mut:#9a9aa6;--acc:#7c5cff;--ok:#33d17a;--warn:#ffb020;--bad:#ff5c5c}
+  *{box-sizing:border-box}body{margin:0;font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+  a{color:var(--acc)}
+  header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0}header .sp{flex:1}.tag{font-size:12px;padding:2px 8px;border:1px solid var(--line);border-radius:999px;color:var(--mut)}
+  main{max-width:1400px;margin:0 auto;padding:20px;display:grid;gap:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card h2{margin:0 0 12px;font-size:14px;text-transform:uppercase;letter-spacing:.05em;color:var(--mut)}
+  input,select{background:#0f0f12;border:1px solid var(--line);color:var(--txt);border-radius:8px;padding:7px 9px;font:inherit}
+  button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:7px 12px;font:inherit;cursor:pointer}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}button.ok{background:var(--ok);color:#04120a}button.bad{background:var(--bad)}
+  button.sm{padding:4px 8px;font-size:12px}
+  table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--panel)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .muted{color:var(--mut)}
+  .pill{padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line)}
+  .pill.ok{color:var(--ok)}.pill.no{color:var(--warn)}
+  .filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .filters label{display:flex;gap:6px;align-items:center;color:var(--mut);font-size:12px}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .stat .k{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+  .stat .v{font-size:20px;font-weight:700;margin-top:2px}
+  .toast{position:fixed;bottom:18px;right:18px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px;opacity:0;transition:.2s;max-width:340px;z-index:10}
+  .toast.show{opacity:1}.hidden{display:none!important}
+  .scroll{overflow:auto;max-height:62vh;border:1px solid var(--line);border-radius:10px}
+</style>
+</head>
+<body>
+<header>
+  <h1>All Cards</h1><span class="tag" id="who">…</span><span class="sp"></span>
+  <a href="/admin/marketplace">Marketplace admin</a> &nbsp; <a href="/seller">Seller view</a> &nbsp; <a href="/admin">Admin</a>
+</header>
+<main>
+  <div class="stats">
+    <div class="stat"><div class="k">Matching</div><div class="v" id="sTotal">—</div></div>
+    <div class="stat"><div class="k">Unsold (this page)</div><div class="v" id="sUnsold">—</div></div>
+    <div class="stat"><div class="k">Sold (this page)</div><div class="v" id="sSold">—</div></div>
+    <div class="stat"><div class="k">Showing</div><div class="v" id="sRange">—</div></div>
+  </div>
+
+  <section class="card">
+    <div class="filters">
+      <label>Base <select id="fBase"><option value="">All bases</option></select></label>
+      <label>Status <select id="fStatus"><option value="all">All</option><option value="unsold">Unsold</option><option value="sold">Sold</option></select></label>
+      <label>Search <input id="fQ" placeholder="number or base" /></label>
+      <label>Per page <input id="fLimit" type="number" value="500" min="1" max="2000" style="width:90px" /></label>
+      <button class="ghost" id="btnRefresh">Apply</button>
+      <button class="ghost" id="btnCopy">Copy page (delivery format)</button>
+      <button class="ghost" id="btnCsv">Export CSV</button>
+      <span class="sp"></span>
+      <button class="ghost" id="btnPrev">‹ Prev</button>
+      <span class="muted" id="pageInfo">—</span>
+      <button class="ghost" id="btnNext">Next ›</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Inventory (full data — unmasked)</h2>
+    <div class="scroll"><table id="tbl">
+      <thead><tr><th>#</th><th>Number</th><th>Exp</th><th>CVV</th><th>BIN</th><th>Brand</th><th>Level</th><th>Issuer</th><th>Country</th><th>Base</th><th>Price</th><th>Status</th><th>Buyer</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const $=s=>document.querySelector(s);
+const money=c=>"$"+((c||0)/100).toFixed(2);
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let tt;function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("show");clearTimeout(tt);tt=setTimeout(()=>t.classList.remove("show"),3200);}
+async function api(path,opts={}){opts.credentials="include";if(opts.body&&typeof opts.body!=="string"){opts.headers=Object.assign({"Content-Type":"application/json"},opts.headers||{});opts.body=JSON.stringify(opts.body);}const r=await fetch(path,opts);let d={};try{d=await r.json();}catch(e){}if(!r.ok){const e=new Error(d.message||("HTTP "+r.status));e.status=r.status;throw e;}return d;}
+function flag(cc){cc=String(cc||"").toUpperCase();if(cc.length!==2)return "";return String.fromCodePoint(...[...cc].map(c=>127397+c.charCodeAt(0)));}
+async function copy(txt){try{await navigator.clipboard.writeText(txt);toast("Copied "+txt.split("\n").length+" line(s)");}catch(e){toast("Copy failed");}}
+
+const S={baseId:"",status:"all",q:"",limit:500,offset:0,total:0,items:[]};
+
+async function boot(){
+  let u;try{u=await api("/api/user");}catch(e){if(e.status===401){location.href="/auth";return;}throw e;}
+  if(u.rank!=="admin"){document.body.innerHTML='<p style="padding:40px">Admins only. <a href="/">Home</a></p>';return;}
+  $("#who").textContent=u.email;
+  await loadBases();
+  $("#btnRefresh").onclick=()=>{readFilters();S.offset=0;load();};
+  $("#fBase").onchange=$("#fStatus").onchange=$("#btnRefresh").onclick;
+  $("#fQ").addEventListener("keydown",e=>{if(e.key==="Enter"){readFilters();S.offset=0;load();}});
+  $("#btnPrev").onclick=()=>{S.offset=Math.max(0,S.offset-S.limit);load();};
+  $("#btnNext").onclick=()=>{if(S.offset+S.limit<S.total){S.offset+=S.limit;load();}};
+  $("#btnCopy").onclick=()=>copy(S.items.map(fullLine).join("\n"));
+  $("#btnCsv").onclick=exportCsv;
+  await load();
+}
+function readFilters(){S.baseId=$("#fBase").value;S.status=$("#fStatus").value;S.q=$("#fQ").value;S.limit=Math.max(1,Math.min(2000,parseInt($("#fLimit").value||"500",10)));}
+async function loadBases(){
+  const bases=await api("/api/admin/card-bases");
+  const sel=$("#fBase");
+  for(const b of bases){const o=document.createElement("option");o.value=b.id;o.textContent=`${b.name} (${b.count??b.stockCount??0})`;sel.append(o);}
+}
+async function load(){
+  const p=new URLSearchParams();
+  if(S.baseId)p.set("baseId",S.baseId);
+  p.set("status",S.status);p.set("limit",S.limit);p.set("offset",S.offset);
+  if(S.q)p.set("q",S.q);
+  const d=await api("/api/admin/cards?"+p.toString());
+  S.items=d.items;S.total=d.total;
+  render();
+}
+function fullLine(c){return [c.cardNumber,c.expiry,c.cvv,c.country,c.extras].filter(Boolean).join("|");}
+function render(){
+  const tb=$("#tbl tbody");tb.innerHTML="";
+  $("#sTotal").textContent=S.total;
+  $("#sUnsold").textContent=S.items.filter(c=>!c.sold).length;
+  $("#sSold").textContent=S.items.filter(c=>c.sold).length;
+  $("#sRange").textContent=S.items.length?`${S.offset+1}–${S.offset+S.items.length}`:"0";
+  $("#pageInfo").textContent=`${S.total} total`;
+  $("#btnPrev").disabled=S.offset<=0;
+  $("#btnNext").disabled=S.offset+S.limit>=S.total;
+  for(const c of S.items){
+    const b=c.binData||{};
+    const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="muted">${c.id}</td>
+      <td class="mono">${esc(c.cardNumber)}</td>
+      <td class="mono">${esc(c.expiry||"—")}</td>
+      <td class="mono">${esc(c.cvv||"—")}</td>
+      <td class="mono">${esc(b.bin||(c.cardNumber||"").slice(0,6))}</td>
+      <td>${esc(b.brand||b.scheme||"—")}</td>
+      <td>${esc(b.type||b.level||"—")}</td>
+      <td>${esc(b.bank||"—")}</td>
+      <td>${flag(b.countryCode)} ${esc(b.country||c.country||"")}</td>
+      <td>${esc(c.baseName||"—")}</td>
+      <td>${c.price!=null?money(c.price):"—"}</td>
+      <td>${c.sold?'<span class="pill ok">sold</span>':'<span class="pill no">unsold</span>'}</td>
+      <td class="muted">${esc(c.buyer||"—")}</td>
+      <td style="white-space:nowrap"></td>`;
+    const td=tr.lastElementChild;
+    td.append(mkBtn("Copy","ghost",()=>copy(fullLine(c))));
+    if(!c.sold)td.append(mkBtn("Delete","bad",async()=>{if(!confirm(`Delete card #${c.id}?`))return;try{await api(`/api/admin/cards/${c.id}`,{method:"DELETE"});toast("Deleted");load();}catch(e){toast(e.message);}}));
+    tb.append(tr);
+  }
+  if(!S.items.length)tb.innerHTML='<tr><td colspan="14" class="muted">No cards match.</td></tr>';
+}
+function mkBtn(label,cls,fn){const b=document.createElement("button");b.textContent=label;b.className=cls+" sm";b.onclick=fn;return b;}
+async function exportCsv(){
+  const p=new URLSearchParams();
+  if(S.baseId)p.set("baseId",S.baseId);
+  p.set("status",S.status);p.set("limit",2000);p.set("offset",0);
+  if(S.q)p.set("q",S.q);
+  const d=await api("/api/admin/cards?"+p.toString());
+  const rows=[["id","number","expiry","cvv","bin","brand","type","level","issuer","country","countryCode","base","price_cents","sold","buyer","extras"]];
+  for(const c of d.items){const b=c.binData||{};rows.push([c.id,c.cardNumber,c.expiry,c.cvv,b.bin||"",b.brand||b.scheme||"",b.type||"",b.level||"",b.bank||"",b.country||"",b.countryCode||"",c.baseName||"",c.price??"",c.sold?1:0,c.buyer||"",(c.extras||"").replace(/[\r\n]+/g," ")]);}
+  const csv=rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(",")).join("\n");
+  const blob=new Blob([csv],{type:"text/csv"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="phantomcardz-cards.csv";a.click();URL.revokeObjectURL(a.href);toast("CSV exported ("+d.items.length+")");
+}
+boot().catch(e=>toast(e.message));
+</script>
+</body>
+</html>

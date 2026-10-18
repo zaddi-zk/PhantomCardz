@@ -1012,6 +1012,10 @@ def seller_dashboard():
 def marketplace_dashboard():
     return FileResponse(os.path.join(FRONTEND, "marketplace-admin.html"), headers={"Cache-Control": "no-cache"})
 
+@app.get("/admin/cards")
+def admin_cards_page():
+    return FileResponse(os.path.join(FRONTEND, "admin-cards.html"), headers={"Cache-Control": "no-cache"})
+
 @app.get("/api/public-config")
 def public_config():
     return {"siteName": SITE, "telegramChannelUrl": TELEGRAM_CHANNEL_URL}
@@ -4667,23 +4671,6 @@ def admin_del_base(bid: int, user: dict = Depends(get_current_user)):
     conn.close()
     return {"ok": True}
 
-@app.get("/api/admin/cards")
-def admin_cards(user: dict = Depends(get_current_user)):
-    require_admin(user)
-    conn = db()
-    rows = conn.execute("""SELECT ca.*, cb.name AS base_name, cb.price AS base_price, cb.hrPercent AS base_hr,
-        bu.email AS buyer FROM cards ca
-        JOIN card_bases cb ON cb.id=ca.base_id
-        LEFT JOIN users bu ON bu.id=ca.buyer_id
-        ORDER BY ca.id DESC LIMIT 500""").fetchall()
-    conn.close()
-    out = []
-    for r in rows:
-        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"], full=True)
-        o["base"] = r["base_name"]; o["sold"] = bool(r["sold"]); o["buyer"] = r["buyer"]
-        out.append(o)
-    return out
-
 @app.patch("/api/admin/variants/{vid}")
 def admin_patch_variant(vid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
     require_admin(user)
@@ -4955,6 +4942,41 @@ def purchase_card(cid: int, request: Request, data: Optional[PurchaseCardIn] = N
         conn.rollback(); conn.close(); raise
     conn.close()
     return out
+
+@app.get("/api/admin/cards")
+def admin_all_cards(baseId: Optional[int] = None, status: str = "all", q: Optional[str] = None,
+                    limit: int = 500, offset: int = 0, user: dict = Depends(get_current_user)):
+    """Full (unmasked) inventory for admins: every card across all bases, any status."""
+    require_admin(user)
+    limit = max(1, min(int(limit or 500), 2000))
+    offset = max(0, int(offset or 0))
+    where, params = ["1=1"], []
+    if baseId:
+        where.append("ca.base_id=?"); params.append(baseId)
+    if status == "sold":
+        where.append("ca.sold=1")
+    elif status == "unsold":
+        where.append("ca.sold=0")
+    if q and q.strip():
+        like = "%" + q.strip() + "%"
+        where.append("(ca.number LIKE ? OR cb.name LIKE ?)")
+        params += [like, like]
+    w = " AND ".join(where)
+    conn = db()
+    total = conn.execute(f"SELECT COUNT(*) FROM cards ca LEFT JOIN card_bases cb ON cb.id=ca.base_id "
+                         f"WHERE {w}", tuple(params)).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT ca.*, cb.name AS base_name, cb.price AS base_price, cb.hrPercent AS base_hr, "
+        f"bu.email AS buyer FROM cards ca LEFT JOIN card_bases cb ON cb.id=ca.base_id "
+        f"LEFT JOIN users bu ON bu.id=ca.buyer_id WHERE {w} ORDER BY ca.id DESC LIMIT ? OFFSET ?",
+        tuple(params) + (limit, offset)).fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        o = card_out(r, r["base_name"], r["base_price"], r["base_hr"], full=True)
+        o["sold"] = bool(r["sold"]); o["buyer"] = r["buyer"]; o["baseId"] = r["base_id"]
+        items.append(o)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 @app.get("/api/admin/card-bases/{bid}/cards")
 def admin_base_cards(bid: int, user: dict = Depends(get_current_user)):
