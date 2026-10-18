@@ -2035,6 +2035,7 @@ def card_bases():
         FROM card_bases b WHERE b.active=1 ORDER BY b.id
     """).fetchall()
     out = [{"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": r["stock_count"],
+            "count": r["stock_count"],
             "refundable": bool(r["refundable"]), "hrPercent": r["hrPercent"] or 80} for r in rows]
     conn.close()
     return out
@@ -3336,7 +3337,7 @@ def seller_bases(user: dict = Depends(get_current_user)):
     conn.close()
     return [{"id": r["id"], "name": r["name"], "price": r["price"], "active": bool(r["active"]),
              "refundable": bool(r["refundable"]), "stockCount": r["stock_count"],
-             "soldCount": r["sold_count"]} for r in rows]
+             "count": r["stock_count"], "soldCount": r["sold_count"]} for r in rows]
 
 class SellerCardsIn(BaseModel):
     baseId: int
@@ -3513,7 +3514,8 @@ def admin_seller_detail(uid: int, user: dict = Depends(get_current_user)):
         "FROM card_bases b WHERE b.owner_id=? ORDER BY b.id DESC", (uid,)).fetchall()
     card_bases = [{"id": b["id"], "name": b["name"], "priceCents": _safe_cents(b["price"]),
                    "active": bool(b["active"]), "refundable": bool(b["refundable"]),
-                   "stockCount": b["stock_count"], "soldCount": b["sold_count"]} for b in baserows]
+                   "stockCount": b["stock_count"], "count": b["stock_count"],
+                   "soldCount": b["sold_count"]} for b in baserows]
     rows = conn.execute(
         "SELECT l.*, o.created_at AS order_created, o.status AS order_status, "
         "COALESCE(v.name, cb.name) AS item_name, bu.email AS buyer "
@@ -3648,7 +3650,7 @@ def admin_listings(user: dict = Depends(get_current_user)):
             "cardBases": [{"id": b["id"], "name": b["name"], "price": b["price"],
                            "active": bool(b["active"]), "refundable": bool(b["refundable"]),
                            "ownerId": b["owner_id"], "ownerEmail": b["owner_email"],
-                           "stockCount": b["stock_count"]} for b in bases]}
+                           "stockCount": b["stock_count"], "count": b["stock_count"]} for b in bases]}
 
 class ListingDecisionIn(BaseModel):
     status: Optional[str] = None
@@ -4619,7 +4621,8 @@ def admin_list_bases(user: dict = Depends(get_current_user)):
     conn.close()
     return [{"id": r["id"], "name": r["name"], "price": r["price"], "active": bool(r["active"]),
              "refundable": bool(r["refundable"]), "hrPercent": r["hrPercent"],
-             "stockCount": r["stock_count"], "cardCount": r["card_count"], "soldCount": r["sold_count"]}
+             "count": r["stock_count"], "stockCount": r["stock_count"],
+             "cardCount": r["card_count"], "soldCount": r["sold_count"]}
             for r in rows]
 
 @app.post("/api/admin/card-bases")
@@ -4787,6 +4790,7 @@ def worker_bases(user: dict = Depends(get_current_user)):
         FROM card_bases b WHERE b.active=1
     """).fetchall()
     out = [{"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": r["stock_count"],
+            "count": r["stock_count"],
             "refundable": bool(r["refundable"]), "hrPercent": r["hrPercent"]} for r in rows]
     conn.close()
     return out
