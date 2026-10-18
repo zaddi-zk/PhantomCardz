@@ -713,11 +713,27 @@ async def on_api_error(request, exc: ApiError):
         body["code"] = exc.code
     return JSONResponse(body, status_code=exc.status)
 
+SPA_ROUTES = (
+    "/admin", "/auth", "/become-reseller", "/cards", "/cart", "/checker",
+    "/crypto-payment", "/deposit", "/forgot-password", "/games", "/my-code",
+    "/my-deposits", "/order", "/orders", "/privacy", "/privacy-policy",
+    "/product", "/profile", "/redeem", "/reset-password", "/shop", "/support",
+    "/terms", "/terms-of-service", "/worker", "/seller",
+)
+
+def _is_spa_route(path: str) -> bool:
+    if path == "/":
+        return True
+    for base in SPA_ROUTES:
+        if path == base or path.startswith(base + "/"):
+            return True
+    return False
+
 @app.exception_handler(StarletteHTTPException)
 async def spa_or_json_404(request: Request, exc: StarletteHTTPException):
     path = request.url.path
-    last = path.rsplit("/", 1)[-1]
-    if exc.status_code == 404 and not path.startswith("/api") and not path.startswith("/uploads") and "." not in last:
+    if (exc.status_code == 404 and not path.startswith("/api")
+            and not path.startswith("/uploads") and _is_spa_route(path)):
         return FileResponse(os.path.join(FRONTEND, "index.html"))
     msg = exc.detail if isinstance(exc.detail, str) else "Error"
     return JSONResponse({"message": msg}, status_code=exc.status_code)
@@ -929,6 +945,16 @@ def read_root(request: Request):
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "api"}
+
+@app.get("/robots.txt")
+def robots():
+    return Response("User-agent: *\nDisallow: /api/\nDisallow: /admin\nDisallow: /seller\nDisallow: /worker\n",
+                    media_type="text/plain")
+
+@app.get("/favicon.ico")
+@app.get("/favicon.png")
+def favicon():
+    return FileResponse(os.path.join(FRONTEND, "phantom-cardz-favicon.svg"), media_type="image/svg+xml")
 
 @app.get("/seller")
 def seller_dashboard():
