@@ -603,10 +603,58 @@ def migrate_money_to_cents(conn):
     conn.commit()
     audit("money_migrate", "-", "money unit migrated to cents")
 
+def _find_or_create_base(conn, name: str, *, price_cents: int, refundable: bool = False,
+                         hr_percent: float = 80, owner_id: Optional[int] = None):
+    """Reuse an existing base with the same name inside the same owner scope.
+
+    Keeps the storefront categories accurate: re-listing under a name that
+    already exists returns that base instead of spawning a duplicate tab.
+    ``owner_id=None`` is the store/admin/worker namespace; sellers are scoped
+    to their own id so two sellers may each own a same-named base.
+    """
+    name = (name or "").strip()
+    if owner_id is None:
+        row = conn.execute("SELECT id FROM card_bases WHERE owner_id IS NULL "
+                           "AND lower(trim(name))=lower(?) ORDER BY id LIMIT 1", (name,)).fetchone()
+    else:
+        row = conn.execute("SELECT id FROM card_bases WHERE owner_id=? "
+                           "AND lower(trim(name))=lower(?) ORDER BY id LIMIT 1", (owner_id, name)).fetchone()
+    if row:
+        return row["id"], False
+    if owner_id is None:
+        bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,?)",
+                        (name, price_cents, 1 if refundable else 0, hr_percent))
+    else:
+        bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent,owner_id) "
+                              "VALUES(?,?,1,?,?,?)",
+                        (name, price_cents, 1 if refundable else 0, hr_percent, owner_id))
+    return bid, True
+
+def _merge_duplicate_bases(conn):
+    """Collapse duplicate bases (same name within the same owner scope) onto the
+    oldest row, re-pointing their cards. Idempotent; safe to run every startup.
+    """
+    rows = conn.execute("SELECT id, name, owner_id FROM card_bases ORDER BY id").fetchall()
+    seen = {}
+    changed = 0
+    for r in rows:
+        key = (r["owner_id"], (r["name"] or "").strip().lower())
+        keep = seen.get(key)
+        if keep is None:
+            seen[key] = r["id"]
+        elif r["id"] != keep:
+            conn.execute("UPDATE cards SET base_id=? WHERE base_id=?", (keep, r["id"]))
+            conn.execute("DELETE FROM card_bases WHERE id=?", (r["id"],))
+            changed += 1
+    if changed:
+        conn.commit()
+        audit("bases_deduped", "-", f"merged {changed} duplicate base(s)")
+
 def init_db():
     conn = db()
     ensure_schema(conn)
     migrate_money_to_cents(conn)
+    _merge_duplicate_bases(conn)
     c = conn.cursor()
     # Guarantee the configured admin account exists and can reach /admin.
     admin_row = c.execute("SELECT id, rank FROM users WHERE email=?", (ADMIN_EMAIL,)).fetchone()
@@ -1984,7 +2032,7 @@ def card_bases():
     conn = db()
     rows = conn.execute("""
         SELECT b.*, (SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count
-        FROM card_bases b WHERE b.active=1
+        FROM card_bases b WHERE b.active=1 ORDER BY b.id
     """).fetchall()
     out = [{"id": r["id"], "name": r["name"], "price": r["price"], "stockCount": r["stock_count"],
             "refundable": bool(r["refundable"]), "hrPercent": r["hrPercent"] or 80} for r in rows]
@@ -3271,11 +3319,10 @@ def seller_add_base(data: SellerBaseIn, user: dict = Depends(get_current_user)):
     if not name:
         raise ApiError(400, "Base name is required")
     conn = db()
-    bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent,owner_id) "
-                          "VALUES(?,?,1,?,80,?)",
-                    (name, _money(data.price), 1 if data.refundable else 0, user["id"]))
+    bid, created = _find_or_create_base(conn, name, price_cents=_money(data.price),
+                                        refundable=bool(data.refundable), hr_percent=80, owner_id=user["id"])
     conn.commit(); conn.close()
-    return {"id": bid, "ok": True}
+    return {"id": bid, "ok": True, "created": created}
 
 @app.get("/api/seller/card-bases")
 def seller_bases(user: dict = Depends(get_current_user)):
@@ -4505,11 +4552,12 @@ def admin_add_base(data: CardBaseIn, user: dict = Depends(get_current_user)):
     if not name:
         raise ApiError(400, "Base name is required")
     conn = db()
-    bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,?)",
-                    (name, _money(data.price), 1 if data.refundable else 0, data.hrPercent))
+    bid, created = _find_or_create_base(conn, name, price_cents=_money(data.price),
+                                        refundable=bool(data.refundable),
+                                        hr_percent=data.hrPercent, owner_id=None)
     conn.commit()
     conn.close()
-    return {"ok": True, "id": bid}
+    return {"ok": True, "id": bid, "created": created}
 
 @app.patch("/api/admin/card-bases/{bid}")
 def admin_patch_base(bid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
@@ -4774,10 +4822,10 @@ def worker_add_base(data: WorkerBaseIn, user: dict = Depends(get_current_user)):
     if not name:
         raise ApiError(400, "Base name is required")
     conn = db()
-    bid = insert_id(conn, "INSERT INTO card_bases(name,price,active,refundable,hrPercent) VALUES(?,?,1,?,80)",
-                    (name, _money(data.price), 1 if data.refundable else 0))
+    bid, created = _find_or_create_base(conn, name, price_cents=_money(data.price),
+                                        refundable=bool(data.refundable), hr_percent=80, owner_id=None)
     conn.commit(); conn.close()
-    return {"id": bid, "ok": True}
+    return {"id": bid, "ok": True, "created": created}
 
 # ---- cards ----
 class PurchaseCardIn(BaseModel):
