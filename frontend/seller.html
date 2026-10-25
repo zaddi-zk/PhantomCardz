@@ -39,6 +39,7 @@
   <a href="/">Storefront</a>
 </header>
 <main>
+  <p class="muted" id="loading">Loading seller dashboard…</p>
   <section class="card hidden" id="applyCard">
     <h2>Become a seller</h2>
     <p class="muted">Apply to list your products and get paid automatically on every sale.</p>
@@ -125,14 +126,18 @@ async function boot(){
   }
 }
 async function refresh(){
-  const e = await api("/api/seller/earnings");
+  const [e, products, bases, sales, payouts] = await Promise.all([
+    api("/api/seller/earnings"), api("/api/seller/products"),
+    api("/api/seller/card-bases"), api("/api/seller/sales"),
+    api("/api/seller/payouts")
+  ]);
   $("#bPending").textContent=money(e.pendingCents); $("#bAvail").textContent=money(e.availableCents);
   $("#bWith").textContent=money(e.withdrawableCents); $("#bGross").textContent=money(e.grossCents);
   $("#bFee").textContent=money(e.feeCents); $("#bComm").textContent=((e.commissionBps||0)/100).toFixed(2)+"%";
-  renderProducts(await api("/api/seller/products"));
-  renderBases(await api("/api/seller/card-bases"));
-  renderSales(await api("/api/seller/sales"));
-  renderPayouts(await api("/api/seller/payouts"));
+  renderProducts(products);
+  renderBases(bases);
+  renderSales(sales);
+  renderPayouts(payouts);
 }
 function el(tag,attrs,...kids){const n=document.createElement(tag);for(const k in (attrs||{})){if(k==="onclick")n.onclick=attrs[k];else if(k==="class")n.className=attrs[k];else if(k==="html")n.innerHTML=attrs[k];else n.setAttribute(k,attrs[k]);}for(const k of kids)n.append(k);return n;}
 function renderProducts(ps){
@@ -183,7 +188,7 @@ $("#applyBtn").onclick = async () => { try{ await api("/api/seller/apply",{metho
 $("#npBtn").onclick = async () => { try{ await api("/api/seller/products",{method:"POST",body:{name:$("#npName").value,description:$("#npDesc").value}}); toast("Product created (pending review)"); $("#npName").value=""; $("#npDesc").value=""; refresh(); }catch(e){toast(e.message);} };
 $("#nbBtn").onclick = async () => { try{ await api("/api/seller/card-bases",{method:"POST",body:{name:$("#nbName").value,price:Math.round(parseFloat($("#nbPrice").value||0)*100)}}); toast("Base created"); $("#nbName").value=""; refresh(); }catch(e){toast(e.message);} };
 $("#poBtn").onclick = async () => { try{ await api("/api/seller/payouts",{method:"POST",body:{amount:parseFloat($("#poAmt").value||0),method:$("#poMethod").value,destination:$("#poDest").value}}); toast("Payout requested"); refresh(); }catch(e){toast(e.message);} };
-boot().catch(e=>toast(e.message));
+boot().catch(e=>toast(e.message)).finally(()=>$("#loading")?.classList.add("hidden"));
 </script>
 </body>
 </html>

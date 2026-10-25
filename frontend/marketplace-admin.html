@@ -65,7 +65,7 @@
     <div id="sideSellers" class="sidelist"></div>
     <div class="links"><a href="/admin/cards">All cards</a><a href="/seller">Seller view</a><a href="/admin">Admin</a><a href="/">Store</a></div>
   </aside>
-  <main class="main" id="view"></main>
+  <main class="main" id="view"><p class="muted">Loading marketplace…</p></main>
 </div>
 <div class="toast" id="toast"></div>
 <script>
@@ -86,8 +86,20 @@ async function boot(){
   if(u.rank!=="admin"){document.body.innerHTML='<p style="padding:40px">Admins only. <a href="/">Home</a></p>';return;}
   $("#who").textContent=u.email;
   $("#nav").addEventListener("click",e=>{const b=e.target.closest(".nav");if(b)show(b.dataset.view);});
-  try{await loadAll();}catch(e){toast(e.message);}
-  show("sellers");
+  try{
+    const s=await api("/api/admin/sellers");
+    S.sellers=s.sellers||[];S.applications=s.applications||[];
+    setBadge("#appCount",S.applications.filter(a=>a.status==="pending").length);
+    show(S.view==="applications"?"applications":"sellers");
+    Promise.all([api("/api/admin/listings"),api("/api/admin/payouts")]).then(([l,p])=>{
+      S.listings=l;S.payouts=p||[];
+      setBadge("#pendCount",(l.products||[]).filter(x=>x.status!=="active").length);
+      setBadge("#payCount",S.payouts.filter(x=>x.status==="requested").length);
+      renderSideSellers();
+      if(S.view==="listings")show("listings");
+      if(S.view==="payouts")show("payouts");
+    }).catch(e=>toast(e.message));
+  }catch(e){toast(e.message);show("sellers");}
 }
 
 async function loadAll(){

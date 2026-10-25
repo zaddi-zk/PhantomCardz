@@ -567,7 +567,13 @@ def ensure_schema(conn):
     for _ddl in ("CREATE INDEX IF NOT EXISTS idx_stock_seller ON stock_items(seller_id)",
                  "CREATE INDEX IF NOT EXISTS idx_cards_seller ON cards(seller_id)",
                  "CREATE INDEX IF NOT EXISTS idx_ledger_seller ON seller_ledger(seller_id, status)",
-                 "CREATE INDEX IF NOT EXISTS idx_payouts_seller ON payouts(seller_id, status)"):
+                 "CREATE INDEX IF NOT EXISTS idx_payouts_seller ON payouts(seller_id, status)",
+                 "CREATE INDEX IF NOT EXISTS idx_products_owner ON products(owner_id)",
+                 "CREATE INDEX IF NOT EXISTS idx_variants_product ON variants(productId)",
+                 "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, id)",
+                 "CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id)",
+                 "CREATE INDEX IF NOT EXISTS idx_stock_order ON stock_items(order_id, seller_id, sold)",
+                 "CREATE INDEX IF NOT EXISTS idx_ledger_order ON seller_ledger(order_id, item_type, ref_id)"):
         conn.execute(_ddl)
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
 
@@ -756,7 +762,13 @@ async def maintenance_gate(request: Request, call_next):
             _maint["expires"] = time.time() + 2.0
         if _maint["value"] == "1":
             return JSONResponse({"message": "Maintenance mode, back soon"}, status_code=503)
-    return await call_next(request)
+    resp = await call_next(request)
+    if request.method == "GET" and resp.status_code < 400:
+        if path.startswith("/assets/"):
+            resp.headers.setdefault("Cache-Control", "public, max-age=31536000, immutable")
+        elif not path.startswith("/api/") and not path.startswith("/uploads/"):
+            resp.headers.setdefault("Cache-Control", "no-cache")
+    return resp
 
 @app.exception_handler(ApiError)
 async def on_api_error(request, exc: ApiError):
@@ -3233,9 +3245,10 @@ def _on_order_completed(conn, oid: int):
         tg_notify(f"[{SITE}] Sale on order #{oid} — seller {u['email'] if u else r['seller_id']} "
                   f"earned ${_safe_cents(r['net']) / 100:.2f} (pending escrow)")
 
-def _seller_balances(conn, seller_id: int) -> dict:
+def _seller_balances(conn, seller_id: int, hold: Optional[int] = None) -> dict:
     t = now()
-    hold = _payout_hold_seconds(conn)
+    if hold is None:
+        hold = _payout_hold_seconds(conn)
     row = conn.execute(
         "SELECT "
         "COALESCE(SUM(CASE WHEN status='pending' AND available_at + ?> ? THEN net_cents ELSE 0 END),0) AS pending_c, "
@@ -3253,6 +3266,40 @@ def _seller_balances(conn, seller_id: int) -> dict:
             "committedCents": reserved, "withdrawableCents": withdrawable if withdrawable > 0 else 0,
             "grossCents": _safe_cents(row["gross_c"]), "feeCents": _safe_cents(row["fee_c"]),
             "reversedCents": _safe_cents(row["reversed_c"])}
+
+def _bulk_seller_balances(conn) -> dict:
+    """Balances for every seller in three aggregate queries instead of N+1."""
+    t = now()
+    hold = _payout_hold_seconds(conn)
+    ledger = conn.execute(
+        "SELECT seller_id, "
+        "COALESCE(SUM(CASE WHEN status='pending' AND available_at + ? > ? THEN net_cents ELSE 0 END),0) AS pending_c, "
+        "COALESCE(SUM(CASE WHEN status='pending' AND available_at + ? <= ? THEN net_cents ELSE 0 END),0) AS avail_c, "
+        "COALESCE(SUM(CASE WHEN status='reversed' THEN net_cents ELSE 0 END),0) AS reversed_c, "
+        "COALESCE(SUM(CASE WHEN status!='reversed' THEN gross_cents ELSE 0 END),0) AS gross_c, "
+        "COALESCE(SUM(CASE WHEN status!='reversed' THEN fee_cents ELSE 0 END),0) AS fee_c "
+        "FROM seller_ledger WHERE seller_id IS NOT NULL GROUP BY seller_id",
+        (hold, t, hold, t)).fetchall()
+    reserved = {r["seller_id"]: _safe_cents(r["s"]) for r in conn.execute(
+        "SELECT seller_id, COALESCE(SUM(amount_cents),0) AS s FROM payouts "
+        "WHERE seller_id IS NOT NULL AND status IN ('requested','approved','paid') "
+        "GROUP BY seller_id").fetchall()}
+    out = {}
+    for row in ledger:
+        sid = row["seller_id"]
+        avail = _safe_cents(row["avail_c"])
+        committed = reserved.get(sid, 0)
+        withdrawable = avail - committed
+        out[sid] = {"pendingCents": _safe_cents(row["pending_c"]), "availableCents": avail,
+                    "committedCents": committed,
+                    "withdrawableCents": withdrawable if withdrawable > 0 else 0,
+                    "grossCents": _safe_cents(row["gross_c"]), "feeCents": _safe_cents(row["fee_c"]),
+                    "reversedCents": _safe_cents(row["reversed_c"])}
+    for sid, committed in reserved.items():
+        if sid not in out:
+            out[sid] = {"pendingCents": 0, "availableCents": 0, "committedCents": committed,
+                        "withdrawableCents": 0, "grossCents": 0, "feeCents": 0, "reversedCents": 0}
+    return out
 
 def _owns_product(conn, pid: int, user: dict):
     p = conn.execute("SELECT id, owner_id FROM products WHERE id=?", (pid,)).fetchone()
@@ -3296,17 +3343,23 @@ def seller_products(user: dict = Depends(get_current_user)):
     conn = db()
     rows = conn.execute("SELECT * FROM products WHERE owner_id=? ORDER BY id DESC", (user["id"],)).fetchall()
     vs = conn.execute(
-        "SELECT v.*, "
-        "(SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count, "
-        "(SELECT COUNT(*) FROM stock_items s2 WHERE s2.variant_id=v.id AND s2.sold=1) AS sold_count "
-        "FROM variants v JOIN products p ON p.id=v.productId WHERE p.owner_id=? ORDER BY v.id",
-        (user["id"],)).fetchall()
+        "SELECT v.* FROM variants v JOIN products p ON p.id=v.productId "
+        "WHERE p.owner_id=? ORDER BY v.id", (user["id"],)).fetchall()
+    counts = {r["variant_id"]: (int(r["stock_count"] or 0), int(r["sold_count"] or 0))
+              for r in conn.execute(
+                  "SELECT s.variant_id, "
+                  "SUM(CASE WHEN s.sold=0 THEN 1 ELSE 0 END) AS stock_count, "
+                  "SUM(CASE WHEN s.sold=1 THEN 1 ELSE 0 END) AS sold_count "
+                  "FROM stock_items s JOIN variants v ON v.id=s.variant_id "
+                  "JOIN products p ON p.id=v.productId WHERE p.owner_id=? "
+                  "GROUP BY s.variant_id", (user["id"],)).fetchall()}
     by = {}
     for v in vs:
+        stock_count, sold_count = counts.get(v["id"], (0, 0))
         by.setdefault(v["productId"], []).append(
             {"id": v["id"], "productId": v["productId"], "name": v["name"], "price": v["price"],
              "comparePrice": v["comparePrice"], "minQuantity": v["minQuantity"],
-             "stockCount": v["stock_count"], "soldCount": v["sold_count"]})
+             "stockCount": stock_count, "soldCount": sold_count})
     out = [{"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
             "active": bool(r["active"]), "pinned": bool(r["pinned"]), "status": (r["status"] or "active"),
             "createdAt": ts(r["created_at"]), "variants": by.get(r["id"], [])} for r in rows]
@@ -3383,14 +3436,20 @@ def seller_bases(user: dict = Depends(get_current_user)):
     _require_seller(user)
     conn = db()
     rows = conn.execute(
-        "SELECT b.*, "
-        "(SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count, "
-        "(SELECT COUNT(*) FROM cards c2 WHERE c2.base_id=b.id AND c2.sold=1) AS sold_count "
-        "FROM card_bases b WHERE b.owner_id=? ORDER BY b.id DESC", (user["id"],)).fetchall()
+        "SELECT b.* FROM card_bases b WHERE b.owner_id=? ORDER BY b.id DESC",
+        (user["id"],)).fetchall()
+    counts = {r["base_id"]: (int(r["stock_count"] or 0), int(r["sold_count"] or 0))
+              for r in conn.execute(
+                  "SELECT c.base_id, "
+                  "SUM(CASE WHEN c.sold=0 THEN 1 ELSE 0 END) AS stock_count, "
+                  "SUM(CASE WHEN c.sold=1 THEN 1 ELSE 0 END) AS sold_count "
+                  "FROM cards c JOIN card_bases b ON b.id=c.base_id "
+                  "WHERE b.owner_id=? GROUP BY c.base_id", (user["id"],)).fetchall()}
     conn.close()
     return [{"id": r["id"], "name": r["name"], "price": r["price"], "active": bool(r["active"]),
-             "refundable": bool(r["refundable"]), "stockCount": r["stock_count"],
-             "count": r["stock_count"], "soldCount": r["sold_count"]} for r in rows]
+             "refundable": bool(r["refundable"]), "stockCount": counts.get(r["id"], (0, 0))[0],
+             "count": counts.get(r["id"], (0, 0))[0],
+             "soldCount": counts.get(r["id"], (0, 0))[1]} for r in rows]
 
 class SellerCardsIn(BaseModel):
     baseId: int
@@ -3517,9 +3576,12 @@ def admin_sellers(user: dict = Depends(get_current_user)):
         "SELECT s.*, u.email, u.username, u.rank FROM sellers s "
         "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.user_id DESC").fetchall() \
         if _has_col(conn, "sellers", "user_id") else []
+    balances = _bulk_seller_balances(conn)
     out_accounts = []
     for s in accounts:
-        bal = _seller_balances(conn, s["user_id"])
+        bal = balances.get(s["user_id"]) or {
+            "pendingCents": 0, "availableCents": 0, "committedCents": 0,
+            "withdrawableCents": 0, "grossCents": 0, "feeCents": 0, "reversedCents": 0}
         out_accounts.append({"userId": s["user_id"], "email": s["email"], "username": s["username"],
                              "sellerCode": s["seller_code"], "status": s["status"],
                              "commissionBps": s["commission_bps"], "rank": s["rank"],
@@ -3682,30 +3744,36 @@ def admin_listings(user: dict = Depends(get_current_user)):
     rows = conn.execute(
         "SELECT p.*, u.email AS owner_email, u.username AS owner_username FROM products p "
         "LEFT JOIN users u ON u.id=p.owner_id ORDER BY p.id DESC").fetchall()
-    vs = conn.execute(
-        "SELECT v.*, "
-        "(SELECT COUNT(*) FROM stock_items s WHERE s.variant_id=v.id AND s.sold=0) AS stock_count, "
-        "(SELECT COUNT(*) FROM stock_items s2 WHERE s2.variant_id=v.id AND s2.sold=1) AS sold_count "
-        "FROM variants v ORDER BY v.id").fetchall()
+    vs = conn.execute("SELECT v.* FROM variants v ORDER BY v.id").fetchall()
+    counts = {r["variant_id"]: (int(r["stock_count"] or 0), int(r["sold_count"] or 0))
+              for r in conn.execute(
+                  "SELECT variant_id, "
+                  "SUM(CASE WHEN sold=0 THEN 1 ELSE 0 END) AS stock_count, "
+                  "SUM(CASE WHEN sold=1 THEN 1 ELSE 0 END) AS sold_count "
+                  "FROM stock_items GROUP BY variant_id").fetchall()}
     by = {}
     for v in vs:
+        stock_count, sold_count = counts.get(v["id"], (0, 0))
         by.setdefault(v["productId"], []).append(
             {"id": v["id"], "name": v["name"], "price": v["price"], "minQuantity": v["minQuantity"],
-             "stockCount": v["stock_count"], "soldCount": v["sold_count"]})
+             "stockCount": stock_count, "soldCount": sold_count})
     out = [{"id": r["id"], "name": r["name"], "description": r["description"], "image": r["image"],
             "active": bool(r["active"]), "pinned": bool(r["pinned"]), "status": (r["status"] or "active"),
             "ownerId": r["owner_id"], "ownerEmail": r["owner_email"], "ownerUsername": r["owner_username"],
             "createdAt": ts(r["created_at"]), "variants": by.get(r["id"], [])} for r in rows]
     bases = conn.execute(
-        "SELECT b.*, u.email AS owner_email, "
-        "(SELECT COUNT(*) FROM cards c WHERE c.base_id=b.id AND c.sold=0) AS stock_count "
-        "FROM card_bases b LEFT JOIN users u ON u.id=b.owner_id ORDER BY b.id DESC").fetchall()
+        "SELECT b.*, u.email AS owner_email FROM card_bases b "
+        "LEFT JOIN users u ON u.id=b.owner_id ORDER BY b.id DESC").fetchall()
+    base_counts = {r["base_id"]: int(r["stock_count"] or 0) for r in conn.execute(
+        "SELECT base_id, SUM(CASE WHEN sold=0 THEN 1 ELSE 0 END) AS stock_count "
+        "FROM cards GROUP BY base_id").fetchall()}
     conn.close()
     return {"products": out,
             "cardBases": [{"id": b["id"], "name": b["name"], "price": b["price"],
                            "active": bool(b["active"]), "refundable": bool(b["refundable"]),
                            "ownerId": b["owner_id"], "ownerEmail": b["owner_email"],
-                           "stockCount": b["stock_count"], "count": b["stock_count"]} for b in bases]}
+                           "stockCount": base_counts.get(b["id"], 0),
+                           "count": base_counts.get(b["id"], 0)} for b in bases]}
 
 class ListingDecisionIn(BaseModel):
     status: Optional[str] = None
