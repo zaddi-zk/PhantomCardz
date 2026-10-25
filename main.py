@@ -3570,8 +3570,9 @@ def admin_sellers(user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
     apps = conn.execute(
-        "SELECT a.*, u.email, u.username, u.rank FROM seller_apps a "
-        "LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC").fetchall()
+        "SELECT a.*, u.email, u.username, u.rank, s.commission_bps, s.seller_code "
+        "FROM seller_apps a LEFT JOIN users u ON u.id=a.user_id "
+        "LEFT JOIN sellers s ON s.user_id=a.user_id ORDER BY a.id DESC").fetchall()
     accounts = conn.execute(
         "SELECT s.*, u.email, u.username, u.rank FROM sellers s "
         "LEFT JOIN users u ON u.id=s.user_id ORDER BY s.user_id DESC").fetchall() \
@@ -3589,7 +3590,9 @@ def admin_sellers(user: dict = Depends(get_current_user)):
     conn.close()
     return {"applications": [{"userId": a["user_id"], "email": a["email"], "username": a["username"],
                               "telegram": a["telegram"], "motivation": a["motivation"],
-                              "status": a["status"], "createdAt": ts(a["created_at"])} for a in apps],
+                              "status": a["status"], "createdAt": ts(a["created_at"]),
+                              "commissionBps": a["commission_bps"],
+                              "sellerCode": a["seller_code"]} for a in apps],
             "sellers": out_accounts}
 
 @app.get("/api/admin/sellers/{uid}")
@@ -3682,23 +3685,60 @@ def admin_approve_seller(uid: int, data: Optional[SellerDecisionIn] = None, user
     if not u:
         conn.close()
         raise ApiError(404, "User not found")
-    bps = 1500
+    existing = conn.execute("SELECT * FROM sellers WHERE user_id=?", (uid,)).fetchone()
+    old_bps = None
+    if existing and existing["commission_bps"] is not None:
+        try:
+            old_bps = max(0, min(10000, int(existing["commission_bps"])))
+        except (TypeError, ValueError):
+            old_bps = None
+    provided_bps = None
     if data and data.commissionBps is not None:
         try:
-            bps = max(0, min(10000, int(data.commissionBps)))
+            provided_bps = max(0, min(10000, int(data.commissionBps)))
         except (TypeError, ValueError):
-            bps = 1500
-    code = "SLL-" + secrets.token_hex(3).upper()
-    conn.execute("INSERT INTO sellers(user_id,seller_code,status,commission_bps,approved_at,created_at) "
-                 "VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET status='approved', "
-                 "commission_bps=excluded.commission_bps, approved_at=excluded.approved_at",
-                 (uid, code, "approved", bps, now(), now()))
+            conn.close()
+            raise ApiError(400, "Invalid commission")
+    bps = provided_bps if provided_bps is not None else (old_bps if old_bps is not None else 1500)
+    first_approval = False
+    if existing:
+        code = existing["seller_code"] or ("SLL-" + secrets.token_hex(3).upper())
+        approved_at = existing["approved_at"] or now()
+        if (existing["status"] or "").lower() != "approved":
+            cur = conn.execute(
+                "UPDATE sellers SET status='approved', commission_bps=?, seller_code=?, approved_at=? "
+                "WHERE user_id=? AND lower(COALESCE(status,''))!='approved'",
+                (bps, code, approved_at, uid))
+            first_approval = cur.rowcount == 1
+            if not first_approval:
+                fresh = conn.execute("SELECT * FROM sellers WHERE user_id=?", (uid,)).fetchone()
+                if fresh:
+                    bps = max(0, min(10000, int(fresh["commission_bps"] or 1500)))
+                    code = fresh["seller_code"] or code
+        else:
+            bps = old_bps if old_bps is not None else 1500
+    else:
+        code = "SLL-" + secrets.token_hex(3).upper()
+        cur = conn.execute(
+            "INSERT INTO sellers(user_id,seller_code,status,commission_bps,approved_at,created_at) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(user_id) DO NOTHING",
+            (uid, code, "approved", bps, now(), now()))
+        first_approval = cur.rowcount == 1
+        if not first_approval:
+            fresh = conn.execute("SELECT * FROM sellers WHERE user_id=?", (uid,)).fetchone()
+            if fresh:
+                bps = max(0, min(10000, int(fresh["commission_bps"] or 1500)))
+                code = fresh["seller_code"] or code
     conn.execute("UPDATE seller_apps SET status='approved' WHERE user_id=?", (uid,))
     conn.execute("UPDATE users SET rank='seller' WHERE id=? AND rank NOT IN ('admin','worker')", (uid,))
     conn.commit(); conn.close()
-    audit("seller_approve", user["email"], f"uid={uid} bps={bps}")
-    tg_notify(f"[{SITE}] Seller approved: {u['email']} ({bps/100:.0f}% commission)")
-    return {"ok": True, "status": "approved", "commissionBps": bps, "sellerCode": code}
+    if first_approval:
+        audit("seller_approve", user["email"], f"uid={uid} bps={bps}")
+        tg_notify(f"[{SITE}] Seller approved: {u['email']} ({bps/100:.2f}% commission)")
+    else:
+        audit("seller_approve_repeat", user["email"], f"uid={uid} bps={bps} unchanged")
+    return {"ok": True, "status": "approved", "commissionBps": bps, "sellerCode": code,
+            "alreadyApproved": not first_approval}
 
 @app.post("/api/admin/sellers/{uid}/reject")
 def admin_reject_seller(uid: int, data: Optional[SellerDecisionIn] = None, user: dict = Depends(get_current_user)):
@@ -3727,14 +3767,22 @@ def admin_suspend_seller(uid: int, user: dict = Depends(get_current_user)):
 def admin_patch_seller(uid: int, payload: Dict[str, Any], user: dict = Depends(get_current_user)):
     require_admin(user)
     conn = db()
+    notify = None
     if "commissionBps" in payload:
         try:
             bps = max(0, min(10000, int(payload["commissionBps"])))
         except (TypeError, ValueError):
             conn.close()
             raise ApiError(400, "Invalid commission")
+        old = conn.execute("SELECT commission_bps FROM sellers WHERE user_id=?", (uid,)).fetchone()
+        email = conn.execute("SELECT email FROM users WHERE id=?", (uid,)).fetchone()
         conn.execute("UPDATE sellers SET commission_bps=? WHERE user_id=?", (bps, uid))
+        if old is not None and int(old["commission_bps"] or 0) != bps:
+            notify = f"[{SITE}] Seller commission updated: {email['email'] if email else uid} ({bps/100:.2f}%)"
     conn.commit(); conn.close()
+    if notify:
+        audit("seller_commission", user["email"], f"uid={uid} bps={bps}")
+        tg_notify(notify)
     return {"ok": True}
 
 @app.get("/api/admin/listings")

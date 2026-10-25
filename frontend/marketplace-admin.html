@@ -151,7 +151,14 @@ function renderSellers(v){
   for(const s of S.sellers){
     const cc=v.querySelector(`[data-c="${s.userId}"]`);
     const inp=document.createElement("input");inp.type="number";inp.step="0.01";inp.value=((s.commissionBps||0)/100).toFixed(2);inp.style.width="80px";
-    cc.append(inp,btn("Save","ghost",async()=>{try{await api(`/api/admin/sellers/${s.userId}`,{method:"PATCH",body:{commissionBps:Math.round(parseFloat(inp.value||0)*100)}});toast("Saved");S.sellers=[];await loadAll();show("sellers");}catch(e){toast(e.message);}}));
+    const saveBtn=btn("Save","ghost",()=>{});
+    saveBtn.onclick=async()=>{
+      const pct=parseFloat(inp.value);
+      if(!isFinite(pct)||pct<0||pct>100){toast("Enter a commission from 0 to 100");return;}
+      saveBtn.disabled=true;
+      try{await api(`/api/admin/sellers/${s.userId}`,{method:"PATCH",body:{commissionBps:Math.round(pct*100)}});toast(`Commission set to ${pct.toFixed(2)}%`);S.sellers=[];await loadAll();show("sellers");}catch(e){toast(e.message);}finally{saveBtn.disabled=false;}
+    };
+    cc.append(inp,saveBtn);
     const ac=v.querySelector(`[data-a="${s.userId}"]`);
     ac.append(btn("View","ok",()=>showDetail(s.userId)));
     ac.append(btn("Suspend","bad",async()=>{try{await api(`/api/admin/sellers/${s.userId}/suspend`,{method:"POST",body:{}});toast("Suspended");await loadAll();show("sellers");}catch(e){toast(e.message);}}));
@@ -172,11 +179,27 @@ function renderApplications(v){
   <tbody>${rows||'<tr><td colspan="5" class="muted">No applications.</td></tr>'}</tbody></table></div></section>`;
   for(const a of S.applications){
     const cc=v.querySelector(`[data-c="${a.userId}"]`);
-    const inp=document.createElement("input");inp.type="number";inp.step="0.01";inp.value="15";inp.style.width="80px";
-    cc.append(inp);
     const ac=v.querySelector(`[data-a="${a.userId}"]`);
-    ac.append(btn("Approve","ok",async()=>{try{await api(`/api/admin/sellers/${a.userId}/approve`,{method:"POST",body:{commissionBps:Math.round(parseFloat(inp.value||15)*100)}});toast("Approved");await loadAll();show("applications");}catch(e){toast(e.message);}}));
-    ac.append(btn("Reject","bad",async()=>{try{await api(`/api/admin/sellers/${a.userId}/reject`,{method:"POST",body:{}});toast("Rejected");await loadAll();show("applications");}catch(e){toast(e.message);}}));
+    const approved=a.status==="approved";
+    if(approved){
+      cc.innerHTML=`<span class="muted">${((a.commissionBps??1500)/100).toFixed(2)}%</span>`;
+    }else{
+      const inp=document.createElement("input");inp.type="number";inp.step="0.01";inp.min="0";inp.max="100";
+      inp.value=((a.commissionBps??1500)/100).toFixed(2);inp.style.width="80px";cc.append(inp);
+      const ab=btn("Approve","ok",()=>{});
+      ab.onclick=async()=>{
+        const pct=parseFloat(inp.value);
+        if(!isFinite(pct)||pct<0||pct>100){toast("Enter a commission from 0 to 100");return;}
+        ab.disabled=true;
+        try{await api(`/api/admin/sellers/${a.userId}/approve`,{method:"POST",body:{commissionBps:Math.round(pct*100)}});toast(`Approved at ${pct.toFixed(2)}%`);await loadAll();show("applications");}catch(e){toast(e.message);}finally{ab.disabled=false;}
+      };
+      ac.append(ab);
+      ac.append(btn("Reject","bad",async()=>{try{await api(`/api/admin/sellers/${a.userId}/reject`,{method:"POST",body:{}});toast("Rejected");await loadAll();show("applications");}catch(e){toast(e.message);}}));
+    }
+    if(approved){
+      ac.append(btn("View","ghost",()=>showDetail(a.userId)));
+      ac.append(btn("Suspend","bad",async()=>{try{await api(`/api/admin/sellers/${a.userId}/suspend`,{method:"POST",body:{}});toast("Suspended");await loadAll();show("applications");}catch(e){toast(e.message);}}));
+    }
   }
 }
 
@@ -279,8 +302,24 @@ async function showDetail(uid){
   <section class="card"><h2>Payouts (${(d.payouts||[]).length})</h2><div style="overflow:auto"><table><thead><tr><th>#</th><th>Amount</th><th>Method</th><th>Destination</th><th>Status</th><th>Created</th></tr></thead><tbody>${payHtml||'<tr><td colspan="6" class="muted">No payouts.</td></tr>'}</tbody></table></div></section>`;
 
   const A=v.querySelector("#detailActions");
-  A.append(btn("Save commission","ghost",async()=>{try{await api(`/api/admin/sellers/${uid}`,{method:"PATCH",body:{commissionBps:Math.round(parseFloat(v.querySelector("#dComm").value||0)*100)}});toast("Saved");showDetail(uid);await loadAll();}catch(e){toast(e.message);}}));
-  if(!acct||acct.status!=="approved")A.append(btn("Approve","ok",async()=>{try{await api(`/api/admin/sellers/${uid}/approve`,{method:"POST",body:{commissionBps:Math.round(parseFloat(v.querySelector("#dComm").value||15)*100)}});toast("Approved");showDetail(uid);await loadAll();}catch(e){toast(e.message);}}));
+  const saveBtn=btn("Save commission","ghost",()=>{});
+  saveBtn.onclick=async()=>{
+    const pct=parseFloat(v.querySelector("#dComm").value);
+    if(!isFinite(pct)||pct<0||pct>100){toast("Enter a commission from 0 to 100");return;}
+    saveBtn.disabled=true;
+    try{await api(`/api/admin/sellers/${uid}`,{method:"PATCH",body:{commissionBps:Math.round(pct*100)}});toast(`Commission set to ${pct.toFixed(2)}%`);showDetail(uid);await loadAll();}catch(e){toast(e.message);}finally{saveBtn.disabled=false;}
+  };
+  A.append(saveBtn);
+  if(!acct||acct.status!=="approved"){
+    const approveBtn=btn("Approve","ok",()=>{});
+    approveBtn.onclick=async()=>{
+      const pct=parseFloat(v.querySelector("#dComm").value);
+      if(!isFinite(pct)||pct<0||pct>100){toast("Enter a commission from 0 to 100");return;}
+      approveBtn.disabled=true;
+      try{await api(`/api/admin/sellers/${uid}/approve`,{method:"POST",body:{commissionBps:Math.round(pct*100)}});toast(`Approved at ${pct.toFixed(2)}%`);showDetail(uid);await loadAll();}catch(e){toast(e.message);}finally{approveBtn.disabled=false;}
+    };
+    A.append(approveBtn);
+  }
   if(acct&&acct.status==="approved")A.append(btn("Suspend","bad",async()=>{try{await api(`/api/admin/sellers/${uid}/suspend`,{method:"POST",body:{}});toast("Suspended");showDetail(uid);await loadAll();}catch(e){toast(e.message);}}));
 }
 
