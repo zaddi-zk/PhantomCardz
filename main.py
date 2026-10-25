@@ -1993,6 +1993,38 @@ def bin_data(number: str) -> dict:
     return {"brand": brand, "scheme": brand, "type": "debit", "level": "classic",
             "bank": "Synchrony Bank", "country": "United States", "countryCode": "US"}
 
+_US_STATE_CODES = set(
+    "AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS "
+    "MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC".split())
+
+
+def _safe_card_extras(raw: str) -> str:
+    raw = raw or ""
+    if not raw:
+        return ""
+    pipe = [t.strip() for t in re.split(r"[|\t]", raw)]
+    state = next((t.upper() for t in re.split(r"[|\t:;,]+", raw)
+                  if t.strip().upper() in _US_STATE_CODES), "")
+    city = ""
+    if state:
+        for i, tok in enumerate(pipe):
+            if tok.upper() == state and i > 0:
+                cand = pipe[i - 1].strip()
+                if (cand and len(cand) > 1 and not cand[0].isdigit()
+                        and "@" not in cand and "." not in cand):
+                    city = cand
+                break
+    zip_code = ""
+    for tok in re.split(r"[|\t:;,\s]+", raw):
+        m = re.match(r"^(\d{5})(?:-\d{4})?$", tok.strip())
+        if m:
+            n = int(m.group(1))
+            if 501 <= n <= 99950 and not (1900 <= n <= 2100):
+                zip_code = m.group(1)
+                break
+    return "|".join(p for p in (city, state, zip_code) if p)
+
+
 def card_out(r, base_name=None, base_price=None, base_hr=None, *, full=False) -> dict:
     """Serialize a card row in the shape the frozen SPA expects (plus legacy keys).
 
@@ -2015,7 +2047,8 @@ def card_out(r, base_name=None, base_price=None, base_hr=None, *, full=False) ->
         "expiry": (f"{mm:02d}/{str(yy)[-2:]}" if (mm and full) else ""),
         "cvv": r["cvv"] if full else "",
         "country": "US",
-        "extras": ((r.get("extras") if hasattr(r, "get") else None) or ""),
+        "extras": (((r.get("extras") if hasattr(r, "get") else None) or "") if full
+                   else _safe_card_extras((r.get("extras") if hasattr(r, "get") else None) or "")),
         "price": _card_price if _card_price is not None else (base_price if base_price is not None else None),
         "refundable": (bool(_card_refund) if _card_refund is not None else None),
         "hrPercent": base_hr if base_hr else 80,
@@ -3092,6 +3125,12 @@ def _require_seller(user: dict):
     """An approved seller (or staff acting on the marketplace)."""
     if user.get("rank") not in ("seller", "worker", "admin"):
         raise ApiError(403, "Approved seller only")
+    if user.get("rank") == "seller":
+        conn = db()
+        s = conn.execute("SELECT status FROM sellers WHERE user_id=?", (user["id"],)).fetchone()
+        conn.close()
+        if not s or (s["status"] or "").lower() != "approved":
+            raise ApiError(403, "Seller account is not active")
 
 def _commission_bps(conn, seller_id: int) -> int:
     r = conn.execute("SELECT commission_bps FROM sellers WHERE user_id=?", (seller_id,)).fetchone()
@@ -3595,6 +3634,8 @@ def admin_reject_seller(uid: int, data: Optional[SellerDecisionIn] = None, user:
     conn = db()
     conn.execute("UPDATE seller_apps SET status='rejected' WHERE user_id=?", (uid,))
     conn.execute("UPDATE sellers SET status='rejected' WHERE user_id=?", (uid,))
+    conn.execute("UPDATE users SET rank='user' WHERE id=? AND rank='seller'", (uid,))
+    conn.execute("UPDATE products SET active=0 WHERE owner_id=?", (uid,))
     conn.commit(); conn.close()
     audit("seller_reject", user["email"], f"uid={uid}")
     return {"ok": True, "status": "rejected"}
