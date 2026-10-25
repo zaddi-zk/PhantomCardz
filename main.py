@@ -664,6 +664,10 @@ def init_db():
     elif admin_row["rank"] != "admin":
         c.execute("UPDATE users SET rank='admin' WHERE id=?", (admin_row["id"],))
         audit("admin_promote", ADMIN_EMAIL, "startup rank repair")
+    c.execute("UPDATE users SET rank='seller' WHERE (rank IS NULL OR rank NOT IN ('admin','worker')) "
+              "AND id IN (SELECT user_id FROM sellers WHERE lower(status)='approved')")
+    c.execute("UPDATE users SET rank='user' WHERE rank='seller' "
+              "AND id IN (SELECT user_id FROM sellers WHERE lower(status) IN ('rejected','suspended'))")
     missing_usernames = c.execute(
         "SELECT id FROM users WHERE username IS NULL OR TRIM(username)=''"
     ).fetchall()
@@ -795,8 +799,9 @@ def get_current_user(request: Request, credentials: HTTPAuthorizationCredentials
     if not token:
         raise ApiError(401, "No auth")
     conn = db()
-    u = conn.execute("SELECT u.* FROM tokens t JOIN users u ON u.id=t.user_id WHERE t.token=?",
-                     (token,)).fetchone()
+    u = conn.execute("SELECT u.*, s.status AS seller_status FROM tokens t "
+                     "JOIN users u ON u.id=t.user_id LEFT JOIN sellers s ON s.user_id=u.id "
+                     "WHERE t.token=?", (token,)).fetchone()
     conn.close()
     if not u:
         raise ApiError(401, "Invalid token")
@@ -819,11 +824,15 @@ def role_flags(u) -> dict:
 
 def user_out(u) -> dict:
     tg = u.get("telegram") if hasattr(u, "get") else None
+    seller_status = ((u.get("seller_status") if hasattr(u, "get") else None) or "").lower()
+    rank = u["rank"]
     return {"id": u["id"], "email": u["email"], "username": u["username"],
             "balance": u["balance"], "protectedBalance": 0,
-            "rank": u["rank"], "telegramUsername": (tg.lstrip("@") if tg else None),
+            "rank": rank, "telegramUsername": (tg.lstrip("@") if tg else None),
             "telegramId": (u.get("telegram_id") if hasattr(u, "get") else None),
             "lastDailySpin": None, "createdAt": ts(u["created_at"]),
+            "sellerStatus": seller_status or None,
+            "isSeller": seller_status == "approved" or rank == "seller",
             **role_flags(u)}
 
 def get_setting(conn, key: str, fallback="{}"):
@@ -3112,7 +3121,9 @@ def seller_me(user: dict = Depends(get_current_user)):
     n = conn.execute("SELECT COUNT(*) FROM products WHERE owner_id=?", (user["id"],)).fetchone()[0]
     s = conn.execute("SELECT * FROM sellers WHERE user_id=?", (user["id"],)).fetchone()
     status = (s["status"] if s else None) or (r["status"] if r else "none")
-    bal = _seller_balances(conn, user["id"]) if user.get("rank") in ("seller", "worker", "admin") else None
+    bal = (_seller_balances(conn, user["id"])
+           if user.get("rank") in ("seller", "worker", "admin") or (status or "").lower() == "approved"
+           else None)
     commission = _commission_bps(conn, user["id"]) if s else 1500
     hold = _payout_hold_seconds(conn) // 3600
     conn.close()
@@ -3123,14 +3134,13 @@ def seller_me(user: dict = Depends(get_current_user)):
 # ================= SELLER MARKETPLACE (listings / earnings / payouts) =====
 def _require_seller(user: dict):
     """An approved seller (or staff acting on the marketplace)."""
-    if user.get("rank") not in ("seller", "worker", "admin"):
+    if user.get("rank") in ("worker", "admin"):
+        return
+    conn = db()
+    s = conn.execute("SELECT status FROM sellers WHERE user_id=?", (user["id"],)).fetchone()
+    conn.close()
+    if not s or (s["status"] or "").lower() != "approved":
         raise ApiError(403, "Approved seller only")
-    if user.get("rank") == "seller":
-        conn = db()
-        s = conn.execute("SELECT status FROM sellers WHERE user_id=?", (user["id"],)).fetchone()
-        conn.close()
-        if not s or (s["status"] or "").lower() != "approved":
-            raise ApiError(403, "Seller account is not active")
 
 def _commission_bps(conn, seller_id: int) -> int:
     r = conn.execute("SELECT commission_bps FROM sellers WHERE user_id=?", (seller_id,)).fetchone()
