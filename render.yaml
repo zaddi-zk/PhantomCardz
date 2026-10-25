@@ -20,7 +20,7 @@ services:
       - key: RESET_DEV_CODE
         value: "false"
       - key: ALLOWED_HOSTS
-        sync: false        # set to: phantomcardz.cc,www.phantomcardz.cc,ph-xxxx.onrender.com
+        sync: false        # set to: phantomcardz.xyz,www.phantomcardz.xyz,ph-xxxx.onrender.com
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
@@ -62,7 +62,7 @@ services:
       - key: SMTP_FROM
         sync: false
       - key: PUBLIC_BASE_URL
-        value: https://phantomcardz.cc
+        value: https://www.phantomcardz.xyz
       - key: NOWPAYMENTS_API_KEY
         sync: false
       - key: NOWPAYMENTS_IPN_SECRET

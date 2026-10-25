@@ -81,7 +81,7 @@ edit. `.env` is git-ignored; `.env.example` is committed.
 | `NOWPAYMENTS_IPN_SECRET` | HMAC secret that verifies NOWPayments IPN callbacks      | *(empty)*                                                        |
 | `NOWPAYMENTS_API_BASE` | Override API host (sandbox: `https://api-sandbox.nowpayments.io`) | `https://api.nowpayments.io`                            |
 | `PUBLIC_BASE_URL` | Public origin used for the NOWPayments IPN callback URL      | *(falls back to `ALLOWED_HOSTS[0]`)*                             |
-| `ALLOWED_HOSTS`  | TrustedHost + CORS allow-list (comma-separated)               | `phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1`        |
+| `ALLOWED_HOSTS`  | TrustedHost + CORS allow-list (comma-separated)               | `phantomcardz.xyz,www.phantomcardz.xyz,localhost,127.0.0.1`      |
 | `COOKIE_SECURE`  | Set `session` cookie `Secure` flag (requires HTTPS)           | `false`                                                          |
 | `TELEGRAM_BOT_TOKEN` | Bot token for order/deposit/ticket notifications (blank = off) | *(empty)*                                                    |
 | `TELEGRAM_CHAT_ID`  | Telegram chat id that receives notifications                  | *(empty)*                                                        |
@@ -222,7 +222,7 @@ Notifications are fire-and-forget (never block or fail a request). Without the k
 ## Deployment
 
 See [`docs/DEPLOY.md`](docs/DEPLOY.md) for DNS, systemd unit, nginx reverse proxy,
-and Let's Encrypt HTTPS setup for `phantomcardz.cc`.
+and Let's Encrypt HTTPS setup for `phantomcardz.xyz`.
 
 ## Running on Render
 

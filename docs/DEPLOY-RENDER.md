@@ -81,7 +81,7 @@ live shop). The camelCase columns (`productId`, `comparePrice`, `minQuantity`,
 5. **Fill the `sync: false` environment variables** (Render prompts you for each).
    Paste the Supabase URL into **`DATABASE_URL`**. `ALLOWED_HOSTS` must include:
    - your Render URL host, e.g. `ph-xxxx.onrender.com`
-   - `phantomcardz.cc,www.phantomcardz.cc` once you attach the custom domain
+   - `phantomcardz.xyz,www.phantomcardz.xyz` once you attach the custom domain
      (Settings → Custom Domains; Render provisions free managed TLS automatically).
 6. **Deploy.** Render installs `requirements.txt` and starts
    `uvicorn main:app --host 0.0.0.0 --port $PORT --proxy-headers`.
@@ -138,7 +138,7 @@ approve them manually. To automate crediting/fulfillment, enable NOWPayments:
 ```
 NOWPAYMENTS_API_KEY=<api key>
 NOWPAYMENTS_IPN_SECRET=<ipn secret>
-PUBLIC_BASE_URL=https://phantomcardz.cc
+PUBLIC_BASE_URL=https://www.phantomcardz.xyz
 # NOWPAYMENTS_API_BASE=https://api-sandbox.nowpayments.io   # sandbox only
 ```
 

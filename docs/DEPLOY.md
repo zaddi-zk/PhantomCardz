@@ -1,4 +1,4 @@
-# PhantomCardz — Deployment (phantomcardz.cc)
+# PhantomCardz — Deployment (phantomcardz.xyz)
 
 Target: single Ubuntu/Debian host running the FastAPI app (`main.py`) behind nginx,
 managed by systemd, with HTTPS via Let's Encrypt.
@@ -13,7 +13,7 @@ everything else):
 cp .env.example .env
 # edit .env:
 #   COOKIE_SECURE=true
-#   ALLOWED_HOSTS=phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1
+#   ALLOWED_HOSTS=phantomcardz.xyz,www.phantomcardz.xyz,localhost,127.0.0.1
 #   ADMIN_PASSWORD=<strong-secret>   # only seeds a FRESH market.db
 ```
 
@@ -28,10 +28,10 @@ Point the domain at the server's public IP:
 
 | Type  | Name            | Value         |
 |-------|-----------------|---------------|
-| A     | phantomcardz.cc | `<SERVER_IP>` |
-| CNAME | www             | phantomcardz.cc |
+| A     | phantomcardz.xyz | `<SERVER_IP>` |
+| CNAME | www             | phantomcardz.xyz |
 
-Verify: `dig +short phantomcardz.cc` and `dig +short www.phantomcardz.cc`.
+Verify: `dig +short phantomcardz.xyz` and `dig +short www.phantomcardz.xyz`.
 
 ## 2. systemd service
 
@@ -67,7 +67,7 @@ Create `/etc/nginx/sites-available/phantomcardz`:
 ```nginx
 server {
     listen 80;
-    server_name phantomcardz.cc www.phantomcardz.cc;
+    server_name phantomcardz.xyz www.phantomcardz.xyz;
     client_max_body_size 10M;
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -89,7 +89,7 @@ sudo ln -s /etc/nginx/sites-available/phantomcardz /etc/nginx/sites-enabled/ \
 
 ```bash
 sudo apt install certbot python3-certbot-nginx \
-  && sudo certbot --nginx -d phantomcardz.cc -d www.phantomcardz.cc
+  && sudo certbot --nginx -d phantomcardz.xyz -d www.phantomcardz.xyz
 ```
 
 Certbot installs the certificate, rewrites the nginx server block for TLS, and sets up

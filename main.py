@@ -43,7 +43,7 @@ BTC_ADDR     = os.getenv("BTC_ADDRESS", "bc1qphantom0000000000000000000000000000
 ETH_ADDR     = os.getenv("ETH_ADDRESS", "0xPhantom000000000000000000000000000dead")
 LTC_ADDR     = os.getenv("LTC_ADDRESS", "ltc1qphantom00000000000000000000dead")
 SOL_ADDR     = os.getenv("SOL_ADDRESS", "PhantomSoL1111111111111111111111111111111111")
-DOMAINS      = [d.strip() for d in os.getenv("ALLOWED_HOSTS", "phantomcardz.cc,www.phantomcardz.cc,localhost,127.0.0.1").split(",") if d.strip()]
+DOMAINS      = [d.strip() for d in os.getenv("ALLOWED_HOSTS", "phantomcardz.xyz,www.phantomcardz.xyz,localhost,127.0.0.1").split(",") if d.strip()]
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 TG_BOT  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")          # comma-separated chat IDs that receive every site update
@@ -4260,7 +4260,7 @@ def _tg_link_user(chat_id, from_user, code: str):
     if not row or row["used"]:
         conn.close()
         tg_send(chat_id, "That code is invalid or already used. Generate a new one on your "
-                         "Account page at phantomcardz.cc/account.")
+                         "Account page at phantomcardz.xyz/account.")
         return
     if now() - int(row["created_at"] or 0) > LINK_CODE_TTL:
         conn.close()
