@@ -1,0 +1,1093 @@
+/* ==========================================================================
+   PhantomCardz — dark-fantasy login skin
+   Scoped to the SPA entry page only. Loaded after auth-layout.css so it wins.
+   ========================================================================== */
+
+body:has(.spider-entry-page) {
+  --pcz-purple-900: #4c1d95;  --pcz-purple-800: #6b21a8;
+  --pcz-purple-600: #9333ea;
+  --pcz-purple-400: #a855f7;
+  --pcz-purple-300: #c084fc;
+  --pcz-black: #0a0a0a;
+  --pcz-black-2: #101014;
+  --pcz-black-3: #1a1a1a;
+  --pcz-line: rgba(168, 85, 247, 0.22);
+  --pcz-text: #f6f4fb;
+  --pcz-muted: #a39cb4;
+  --pcz-glow: rgba(147, 51, 234, 0.55);
+  --pcz-font-display: 'UnifrakturMaguntia', 'Cinzel Decorative', 'Times New Roman', serif;
+  --pcz-font-alt: 'Cinzel Decorative', 'Times New Roman', serif;
+  --pcz-font-body: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  background: var(--pcz-black);
+  color: var(--pcz-text);
+  font-family: var(--pcz-font-body);
+  overflow-x: clip;
+}
+
+body:has(.spider-entry-page) .spider-entry-page *,
+body:has(.spider-entry-page) .spider-entry-page *::before,
+body:has(.spider-entry-page) .spider-entry-page *::after {
+  box-sizing: border-box;
+}
+
+/* --------------------------------------------------------------------------
+   Page shell
+   -------------------------------------------------------------------------- */
+
+body:has(.spider-entry-page) .spider-entry-page {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh !important;
+  min-height: 100svh !important;
+  padding: 40px 20px;
+  background: transparent;
+  isolation: isolate;
+}
+
+body:has(.spider-entry-page) .spider-entry-content {
+  position: relative;
+  z-index: 3;
+  width: 100%;
+  max-width: 460px;
+  zoom: 1 !important;
+}
+
+/* Shell holds the wordmark above the glass card */
+.pcz-auth-shell {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  max-width: 520px;
+  min-width: 0;
+}
+
+.pcz-brand-bar {
+  margin: 0 0 26px;
+  text-align: center;
+  animation: pcz-wordmark-in 1.1s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* The old raster logo (JPEG on black → visible seam) is retired. */
+body:has(.spider-entry-page) .nexus-brand {
+  display: none !important;
+}
+
+/* --------------------------------------------------------------------------
+   Wordmark
+   -------------------------------------------------------------------------- */
+
+.pcz-wordmark {
+  display: block;
+  font-family: var(--pcz-font-display);
+  font-size: clamp(2.1rem, 7vw, 3.05rem);
+  font-weight: 400;
+  line-height: 1.05;
+  letter-spacing: 0.01em;
+  text-align: center;
+  color: #fff;
+  text-shadow:
+    0 0 18px rgba(168, 85, 247, 0.55),
+    0 0 46px rgba(147, 51, 234, 0.35),
+    0 2px 0 rgba(0, 0, 0, 0.55);
+  animation: pcz-wordmark-in 1.1s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.pcz-wordmark .pcz-wordmark-accent {
+  color: var(--pcz-purple-400);
+  text-shadow:
+    0 0 22px rgba(168, 85, 247, 0.85),
+    0 0 60px rgba(147, 51, 234, 0.55),
+    0 2px 0 rgba(0, 0, 0, 0.55);
+}
+
+@keyframes pcz-wordmark-in {
+  from {
+    opacity: 0;
+    transform: translateY(-22px) scale(0.97);
+    filter: blur(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Background stack (injected by JS)
+   -------------------------------------------------------------------------- */
+
+#pcz-bg {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 70% 55% at 18% 82%, rgba(107, 33, 168, 0.5) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 50% at 84% 16%, rgba(147, 51, 234, 0.34) 0%, transparent 62%),
+    radial-gradient(ellipse 90% 70% at 50% 55%, rgba(76, 29, 149, 0.28) 0%, transparent 72%),
+    linear-gradient(180deg, #0a0a0a 0%, #0d0a13 45%, #120b1c 100%);
+}
+
+#pcz-bg::after {
+  /* vignette keeps the centre readable */
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 62% 58% at 50% 48%, transparent 30%, rgba(5, 3, 8, 0.72) 100%);
+}
+
+#pcz-smoke {
+  position: absolute;
+  inset: -8%;
+  width: 116%;
+  height: 116%;
+  opacity: 0.9;
+}
+
+#pcz-cards {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+  transform: translate3d(0, 0, 0);
+  transition: transform 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: transform;
+}
+
+#pcz-lightning {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+/* --------------------------------------------------------------------------
+   Floating holographic cards
+   -------------------------------------------------------------------------- */
+
+.pcz-card {
+  position: absolute;
+  width: 116px;
+  height: 162px;
+  border-radius: 13px;
+  background: linear-gradient(150deg, #16121d 0%, #0b0910 60%, #150f20 100%);
+  border: 1px solid rgba(168, 85, 247, 0.38);
+  box-shadow:
+    0 18px 40px rgba(0, 0, 0, 0.55),
+    0 0 26px rgba(147, 51, 234, 0.22),
+    inset 0 0 26px rgba(147, 51, 234, 0.08);
+  overflow: hidden;
+  opacity: 0;
+  animation:
+    pcz-card-in 1.2s cubic-bezier(0.22, 1, 0.36, 1) forwards,
+    pcz-card-float var(--pcz-dur, 6s) ease-in-out var(--pcz-delay, 0s) infinite;
+  animation-delay: var(--pcz-in-delay, 0s), calc(var(--pcz-in-delay, 0s) + 1.2s);
+  will-change: transform, opacity;
+}
+
+/* rotating foil */
+.pcz-card::before {
+  content: '';
+  position: absolute;
+  top: -60%;
+  left: -60%;
+  width: 220%;
+  height: 220%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    rgba(168, 85, 247, 0.5) 55deg,
+    transparent 120deg,
+    rgba(147, 51, 234, 0.42) 185deg,
+    transparent 250deg,
+    rgba(192, 132, 252, 0.45) 305deg,
+    transparent 360deg
+  );
+  mix-blend-mode: color-dodge;
+  opacity: 0.5;
+  animation: pcz-holo-spin 7s linear infinite;
+}
+
+/* card frame + art block */
+.pcz-card::after {
+  content: '';
+  position: absolute;
+  inset: 9px;
+  border-radius: 7px;
+  border: 1px solid rgba(192, 132, 252, 0.22);
+  background:
+    linear-gradient(180deg, rgba(147, 51, 234, 0.34) 0%, rgba(76, 29, 149, 0.18) 52%, rgba(10, 8, 14, 0.9) 100%),
+    repeating-linear-gradient(115deg, rgba(255, 255, 255, 0.045) 0 1px, transparent 1px 9px);
+}
+
+.pcz-card-glyph {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-family: var(--pcz-font-alt);
+  font-size: 15px;
+  font-weight: 900;
+  letter-spacing: 0.28em;
+  color: rgba(255, 255, 255, 0.14);
+  text-shadow: 0 0 12px rgba(168, 85, 247, 0.45);
+  transform: rotate(-32deg);
+  pointer-events: none;
+}
+
+@keyframes pcz-card-float {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) rotate(var(--pcz-rot, 0deg));
+  }
+  50% {
+    transform: translate3d(0, -11px, 0) rotate(calc(var(--pcz-rot, 0deg) + 2.5deg));
+  }
+}
+
+@keyframes pcz-holo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pcz-card-in {
+  from {
+    opacity: 0;
+    transform: translate3d(0, 26px, 0) scale(0.92);
+  }
+  to {
+    opacity: 0.62;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Lightning
+   -------------------------------------------------------------------------- */
+
+.pcz-bolt {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  animation: pcz-bolt-flash 0.62s ease-out forwards;
+}
+
+.pcz-bolt svg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.pcz-bolt-flash {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 70% 60% at 50% 20%, rgba(192, 132, 252, 0.16), transparent 70%);
+  opacity: 0;
+  animation: pcz-sky-flash 0.5s ease-out forwards;
+}
+
+@keyframes pcz-bolt-flash {
+  0% { opacity: 0; }
+  8% { opacity: 0.9; }
+  18% { opacity: 0.15; }
+  26% { opacity: 0.7; }
+  100% { opacity: 0; }
+}
+
+@keyframes pcz-sky-flash {
+  0% { opacity: 0; }
+  10% { opacity: 1; }
+  100% { opacity: 0; }
+}
+
+/* --------------------------------------------------------------------------
+   Grim reaper
+   -------------------------------------------------------------------------- */
+
+#pcz-reaper {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  z-index: 2;
+  width: min(44vw, 560px);
+  height: min(86vh, 780px);
+  pointer-events: none;
+  opacity: 0;
+  transform: translate3d(-72%, 0, 0) scale(0.96);
+  transition:
+    transform 1.25s cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 0.9s ease;
+  filter: drop-shadow(0 0 42px rgba(147, 51, 234, 0.5));
+  will-change: transform, opacity;
+}
+
+#pcz-reaper.pcz-reaper-in {
+  opacity: 1;
+  transform: translate3d(-6%, 0, 0) scale(1);
+}
+
+#pcz-reaper.pcz-reaper-out {
+  opacity: 0;
+  transform: translate3d(120vw, -6%, 0) rotate(8deg);
+  transition:
+    transform 1.15s cubic-bezier(0.5, 0, 0.75, 0),
+    opacity 1.05s ease;
+}
+
+#pcz-reaper svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: visible;
+}
+
+#pcz-reaper .pcz-blade {
+  transform-box: view-box;
+  transform-origin: 300px 154px;
+  transform: rotate(-42deg);
+  transition: transform 1.05s cubic-bezier(0.34, 1.3, 0.64, 1) 0.6s;
+}
+
+#pcz-reaper.pcz-reaper-in .pcz-blade {
+  transform: rotate(0deg);
+}
+
+#pcz-reaper.pcz-reaper-swing .pcz-blade {
+  animation: pcz-scythe-swing 2.6s cubic-bezier(0.45, 0, 0.55, 1) 0.2s;
+}
+
+@keyframes pcz-scythe-swing {
+  0% { transform: rotate(-38deg); }
+  36% { transform: rotate(32deg); }
+  64% { transform: rotate(-18deg); }
+  100% { transform: rotate(0deg); }
+}
+
+#pcz-reaper .pcz-eye {
+  animation: pcz-eye-pulse 3.2s ease-in-out infinite;
+}
+
+#pcz-reaper .pcz-eye-right {
+  animation-delay: 1.1s;
+}
+
+@keyframes pcz-eye-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+#pcz-reaper .pcz-trail {
+  stroke-dasharray: 420;
+  stroke-dashoffset: 420;
+  opacity: 0;
+}
+
+#pcz-reaper.pcz-reaper-in .pcz-trail {
+  animation: pcz-trail-draw 2.4s cubic-bezier(0.22, 1, 0.36, 1) 1.1s forwards;
+}
+
+@keyframes pcz-trail-draw {
+  0% { stroke-dashoffset: 420; opacity: 0; }
+  35% { opacity: 0.95; }
+  100% { stroke-dashoffset: 0; opacity: 0.35; }
+}
+
+#pcz-reaper .pcz-reaper-halo {
+  animation: pcz-halo 5s ease-in-out infinite;
+  transform-origin: 200px 320px;
+}
+
+@keyframes pcz-halo {
+  0%, 100% { opacity: 0.42; transform: scale(1); }
+  50% { opacity: 0.72; transform: scale(1.06); }
+}
+
+/* --------------------------------------------------------------------------
+   Login card — glassmorphism
+   -------------------------------------------------------------------------- */
+
+body:has(.spider-entry-page) :is(.spider-login-card, .spider-register-content) {
+  position: relative;
+  padding: 34px 32px 30px;
+  border-radius: 24px;
+  border: 1px solid rgba(168, 85, 247, 0.26);
+  background:
+    linear-gradient(160deg, rgba(30, 21, 43, 0.94) 0%, rgba(14, 11, 20, 0.95) 55%, rgba(9, 7, 13, 0.97) 100%);
+  backdrop-filter: blur(26px) saturate(120%);
+  -webkit-backdrop-filter: blur(26px) saturate(120%);
+  box-shadow:
+    0 30px 80px rgba(0, 0, 0, 0.72),
+    0 0 70px rgba(147, 51, 234, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    inset 0 0 70px rgba(147, 51, 234, 0.05);
+  animation: pcz-card-rise 1s cubic-bezier(0.22, 1, 0.36, 1) 0.15s both;
+}
+
+body:has(.spider-entry-page) :is(.spider-login-card, .spider-register-content)::before {
+  /* top edge light */
+  content: '';
+  position: absolute;
+  top: -1px;
+  left: 14%;
+  right: 14%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(192, 132, 252, 0.85), transparent);
+}
+
+body:has(.spider-entry-page) :is(.spider-login-card, .spider-register-content)::after {
+  /* soft outer bloom */
+  content: '';
+  position: absolute;
+  inset: -14px;
+  border-radius: 34px;
+  background: radial-gradient(ellipse at 50% 0%, rgba(147, 51, 234, 0.28), transparent 68%);
+  z-index: -1;
+  filter: blur(16px);
+  pointer-events: none;
+}
+
+@keyframes pcz-card-rise {
+  from {
+    opacity: 0;
+    transform: translateY(38px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Headings
+   -------------------------------------------------------------------------- */
+
+body:has(.spider-entry-page) .spider-auth-heading {
+  margin: 0 0 24px;
+  text-align: center;
+}
+
+body:has(.spider-entry-page) .spider-auth-heading h1 {
+  font-family: var(--pcz-font-body);
+  font-size: clamp(1.5rem, 4.4vw, 1.72rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #fff;
+  text-shadow: 0 0 24px rgba(147, 51, 234, 0.4);
+}
+
+body:has(.spider-entry-page) .spider-auth-heading p {
+  margin-top: 9px;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: var(--pcz-muted);
+}
+
+/* --------------------------------------------------------------------------
+   Form
+   -------------------------------------------------------------------------- */
+
+body:has(.spider-entry-page) .spider-form {
+  gap: 18px;
+}
+
+body:has(.spider-entry-page) .spider-field {
+  gap: 7px;
+}
+
+body:has(.spider-entry-page) .spider-field-label {
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: #b9b2c9;
+}
+
+body:has(.spider-entry-page) .spider-field-label span {
+  color: var(--pcz-purple-400);
+}
+
+body:has(.spider-entry-page) .spider-input {
+  height: 50px;
+  padding: 0 16px;
+  border-radius: 12px;
+  border: 1px solid rgba(168, 85, 247, 0.2);
+  background: rgba(8, 6, 12, 0.72);
+  color: #fff;
+  font-size: 0.95rem;
+  transition:
+    border-color 0.22s ease,
+    box-shadow 0.22s ease,
+    background 0.22s ease;
+}
+
+body:has(.spider-entry-page) .spider-input::placeholder {
+  color: rgba(163, 156, 180, 0.62);
+}
+
+body:has(.spider-entry-page) .spider-input:hover {
+  border-color: rgba(168, 85, 247, 0.34);
+}
+
+body:has(.spider-entry-page) .spider-input:focus,
+body:has(.spider-entry-page) .spider-input:focus-visible {
+  outline: none;
+  border-color: var(--pcz-purple-600);
+  background: rgba(12, 8, 18, 0.9);
+  box-shadow:
+    0 0 0 3px rgba(147, 51, 234, 0.16),
+    0 0 24px rgba(147, 51, 234, 0.32);
+}
+
+body:has(.spider-entry-page) .spider-password-field {
+  position: relative;
+}
+
+body:has(.spider-entry-page) .spider-password-field .spider-input {
+  padding-right: 46px;
+}
+
+body:has(.spider-entry-page) .spider-password-toggle {
+  color: rgba(163, 156, 180, 0.8);
+  border-radius: 8px;
+  transition: color 0.2s ease, background 0.2s ease;
+}
+
+body:has(.spider-entry-page) .spider-password-toggle:hover {
+  color: var(--pcz-purple-300);
+  background: rgba(147, 51, 234, 0.12);
+}
+
+body:has(.spider-entry-page) .spider-login-options {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.84rem;
+}
+
+body:has(.spider-entry-page) .spider-checkbox-label {
+  color: var(--pcz-muted);
+  gap: 9px;
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+
+body:has(.spider-entry-page) .spider-checkbox-label:hover {
+  color: #ddd6ea;
+}
+
+body:has(.spider-entry-page) .spider-checkbox-label input {
+  width: 17px;
+  height: 17px;
+  accent-color: var(--pcz-purple-600);
+  cursor: pointer;
+}
+
+body:has(.spider-entry-page) .spider-muted-link,
+body:has(.spider-entry-page) .spider-login-options a {
+  color: var(--pcz-purple-300);
+  text-decoration: none;
+  font-weight: 500;
+  border-radius: 4px;
+  transition: color 0.2s ease, text-shadow 0.2s ease;
+}
+
+body:has(.spider-entry-page) .spider-muted-link:hover,
+body:has(.spider-entry-page) .spider-login-options a:hover {
+  color: #fff;
+  text-shadow: 0 0 14px rgba(168, 85, 247, 0.9);
+}
+
+/* --------------------------------------------------------------------------
+   Bot verification (restyled only — logic untouched)
+   -------------------------------------------------------------------------- */
+
+body:has(.spider-entry-page) .spider-captcha {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 62px;
+  padding: 9px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(168, 85, 247, 0.2);
+  background: rgba(8, 6, 12, 0.6);
+  transition: border-color 0.22s ease, box-shadow 0.22s ease;
+}
+
+body:has(.spider-entry-page) .spider-captcha:focus-within {
+  border-color: rgba(168, 85, 247, 0.55);
+  box-shadow: 0 0 0 3px rgba(147, 51, 234, 0.12);
+}
+
+body:has(.spider-entry-page) .spider-captcha > svg {
+  border-radius: 9px;
+  flex: none;
+  box-shadow: inset 0 0 18px rgba(147, 51, 234, 0.28);
+}
+
+body:has(.spider-entry-page) .spider-captcha-refresh svg {
+  width: 17px;
+  height: 17px;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+body:has(.spider-entry-page) .spider-captcha-input {
+  flex: 1 1 0;
+  width: 0;
+  min-width: 0;
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #fff;
+  font-size: 0.92rem;
+  letter-spacing: 0.06em;
+}
+
+body:has(.spider-entry-page) .spider-captcha-input::placeholder {
+  color: rgba(163, 156, 180, 0.6);
+  letter-spacing: 0;
+}
+
+body:has(.spider-entry-page) .spider-captcha-input:focus {
+  outline: none;
+  border-color: rgba(168, 85, 247, 0.45);
+  background: rgba(12, 8, 18, 0.8);
+}
+
+body:has(.spider-entry-page) .spider-captcha-refresh {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  color: rgba(163, 156, 180, 0.85);
+  background: transparent;
+  transition: color 0.2s ease, background 0.2s ease, transform 0.35s ease;
+}
+
+body:has(.spider-entry-page) .spider-captcha-refresh:hover {
+  color: var(--pcz-purple-300);
+  background: rgba(147, 51, 234, 0.14);
+  transform: rotate(90deg);
+}
+
+/* --------------------------------------------------------------------------
+   Primary button
+   -------------------------------------------------------------------------- */
+
+body:has(.spider-entry-page) .spider-primary-button {
+  position: relative;
+  overflow: hidden;
+  min-height: 52px;
+  border: 1px solid rgba(192, 132, 252, 0.4);
+  border-radius: 13px;
+  background: linear-gradient(135deg, #6b21a8 0%, #9333ea 52%, #a855f7 100%);
+  color: #fff;
+  font-size: 0.98rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  box-shadow:
+    0 10px 28px rgba(107, 33, 168, 0.45),
+    0 0 26px rgba(147, 51, 234, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  transition:
+    transform 0.16s ease,
+    box-shadow 0.24s ease,
+    filter 0.24s ease;
+}
+
+body:has(.spider-entry-page) .spider-primary-button::before {
+  /* sheen */
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -120%;
+  width: 60%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.28), transparent);
+  transform: skewX(-18deg);
+  transition: left 0.55s ease;
+  pointer-events: none;
+}
+
+body:has(.spider-entry-page) .spider-primary-button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  filter: brightness(1.08);
+  box-shadow:
+    0 16px 38px rgba(107, 33, 168, 0.6),
+    0 0 46px rgba(168, 85, 247, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+
+body:has(.spider-entry-page) .spider-primary-button:hover:not(:disabled)::before {
+  left: 130%;
+}
+
+body:has(.spider-entry-page) .spider-primary-button:active:not(:disabled) {
+  transform: translateY(0) scale(0.994);
+}
+
+body:has(.spider-entry-page) .spider-primary-button:focus-visible {
+  outline: 2px solid var(--pcz-purple-300);
+  outline-offset: 3px;
+}
+
+body:has(.spider-entry-page) .spider-primary-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+  filter: saturate(0.85);
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+body:has(.spider-entry-page) .spider-primary-button:disabled::before {
+  opacity: 0;
+}
+
+.pcz-ripple {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.55);
+  transform: translate(-50%, -50%) scale(0);
+  animation: pcz-ripple 0.62s ease-out forwards;
+  pointer-events: none;
+}
+
+@keyframes pcz-ripple {
+  to {
+    transform: translate(-50%, -50%) scale(22);
+    opacity: 0;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Welcome message + footer
+   -------------------------------------------------------------------------- */
+
+.pcz-welcome {
+  margin: 2px 0 0;
+  text-align: center;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--pcz-purple-300);
+  text-shadow: 0 0 22px rgba(168, 85, 247, 0.7);
+  animation: pcz-welcome-in 0.55s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes pcz-welcome-in {
+  from {
+    opacity: 0;
+    transform: translateY(9px);
+    filter: blur(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+    filter: blur(0);
+  }
+}
+
+/* Confirmation that survives the SPA's immediate route change after login. */
+.pcz-welcome-flash {
+  position: fixed;
+  z-index: 2147483001;
+  left: 50%;
+  top: 22px;
+  transform: translateX(-50%);
+  padding: 13px 30px;
+  border: 1px solid rgba(168, 85, 247, 0.45);
+  border-radius: 999px;
+  background:
+    linear-gradient(135deg, rgba(46, 24, 70, 0.94), rgba(18, 12, 28, 0.96));
+  color: #f6eeff;
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  box-shadow:
+    0 18px 42px rgba(0, 0, 0, 0.55),
+    0 0 34px rgba(147, 51, 234, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  animation: pcz-flash-life 3.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+  pointer-events: none;
+}
+
+.pcz-welcome-flash::before {
+  content: '';
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 10px;
+  border-radius: 50%;
+  background: #c084fc;
+  box-shadow: 0 0 12px #c084fc;
+  vertical-align: middle;
+}
+
+@keyframes pcz-flash-life {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -14px) scale(0.96);
+    filter: blur(5px);
+  }
+  10%,
+  80% {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+    filter: blur(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -8px) scale(0.98);
+    filter: blur(4px);
+  }
+}
+
+body:has(.spider-entry-page) .spider-auth-switch {
+  margin-top: 2px;
+  text-align: center;
+  font-size: 0.88rem;
+  color: var(--pcz-muted);
+}
+
+body:has(.spider-entry-page) .spider-auth-switch button {
+  color: var(--pcz-purple-300);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  border-radius: 4px;
+  transition: color 0.2s ease, text-shadow 0.2s ease;
+}
+
+body:has(.spider-entry-page) .spider-auth-switch button:hover {
+  color: #fff;
+  text-shadow: 0 0 14px rgba(168, 85, 247, 0.9);
+}
+
+body:has(.spider-entry-page) .spider-entry-footer {
+  margin-top: 22px;
+  gap: 12px;
+  justify-content: center;
+  font-size: 0.82rem;
+  color: rgba(163, 156, 180, 0.75);
+}
+
+body:has(.spider-entry-page) .spider-entry-footer a {
+  color: rgba(163, 156, 180, 0.75);
+  text-decoration: none;
+  border-radius: 4px;
+  transition: color 0.2s ease;
+}
+
+body:has(.spider-entry-page) .spider-entry-footer a:hover {
+  color: var(--pcz-purple-300);
+}
+
+/* --------------------------------------------------------------------------
+   Responsive
+   -------------------------------------------------------------------------- */
+
+@media (max-width: 1180px) {
+  #pcz-reaper {
+    width: min(40vw, 440px);
+    opacity: 0.85;
+  }
+
+  .pcz-card {
+    width: 96px;
+    height: 134px;
+  }
+}
+
+@media (max-width: 900px) {
+  #pcz-reaper {
+    display: none;
+  }
+
+  .pcz-card:nth-child(n + 5) {
+    display: none;
+  }
+}
+
+@media (max-width: 560px) {
+  body:has(.spider-entry-page) .spider-entry-page {
+    padding: 26px 16px;
+    align-items: center;
+  }
+
+  body:has(.spider-entry-page) .spider-entry-content {
+    max-width: 100%;
+  }
+
+  body:has(.spider-entry-page) :is(.spider-login-card, .spider-register-content) {
+    padding: 26px 20px 24px;
+    border-radius: 20px;
+  }
+
+  body:has(.spider-entry-page) .spider-auth-heading h1 {
+    font-size: 1.4rem;
+  }
+
+  body:has(.spider-entry-page) .spider-input {
+    height: 48px;
+  }
+
+  body:has(.spider-entry-page) .spider-primary-button {
+    min-height: 50px;
+  }
+
+  .pcz-card {
+    width: 76px;
+    height: 106px;
+  }
+
+  .pcz-card:nth-child(1) {
+    top: 78% !important;
+    left: -4% !important;
+  }
+
+  .pcz-card:nth-child(2) {
+    top: 90% !important;
+    right: -5% !important;
+  }
+
+  .pcz-card:nth-child(3) {
+    top: 66% !important;
+    right: -6% !important;
+  }
+
+  .pcz-card:nth-child(n + 4) {
+    display: none;
+  }
+
+  /* captcha: keep the code, input and refresh on one row */
+  body:has(.spider-entry-page) .spider-captcha {
+    gap: 8px;
+    padding: 8px 9px;
+  }
+
+  body:has(.spider-entry-page) .spider-captcha > svg {
+    width: 104px;
+    height: 36px;
+  }
+
+  body:has(.spider-entry-page) .spider-captcha-input {
+    flex: 1 1 0;
+    width: 0;
+    height: 36px;
+    padding: 0 6px;
+    font-size: 0.85rem;
+  }
+
+  body:has(.spider-entry-page) .spider-captcha-input::placeholder {
+    font-size: 0.8rem;
+  }
+
+  body:has(.spider-entry-page) .spider-captcha-refresh {
+    width: 30px;
+    height: 30px;
+  }
+
+  #pcz-bg {
+    background:
+      radial-gradient(ellipse 90% 45% at 20% 88%, rgba(107, 33, 168, 0.45) 0%, transparent 62%),
+      radial-gradient(ellipse 80% 40% at 85% 10%, rgba(147, 51, 234, 0.3) 0%, transparent 64%),
+      linear-gradient(180deg, #0a0a0a 0%, #120b1c 100%);
+  }
+}
+
+/* Short viewports: keep the card usable without clipping */
+@media (max-height: 780px) and (min-width: 561px) {
+  body:has(.spider-entry-page) .spider-entry-page {
+    padding: 22px 20px;
+  }
+
+  body:has(.spider-entry-page) .nexus-brand {
+    margin-bottom: 14px;
+  }
+
+  .pcz-wordmark {
+    font-size: clamp(1.8rem, 5vw, 2.4rem);
+  }
+
+  body:has(.spider-entry-page) :is(.spider-login-card, .spider-register-content) {
+    padding: 24px 28px 22px;
+  }
+
+  body:has(.spider-entry-page) .spider-form {
+    gap: 13px;
+  }
+
+  body:has(.spider-entry-page) .spider-input {
+    height: 44px;
+  }
+
+  body:has(.spider-entry-page) .spider-primary-button {
+    min-height: 46px;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Motion preferences
+   -------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .pcz-wordmark,
+  body:has(.spider-entry-page) :is(.spider-login-card, .spider-register-content),
+  .pcz-card,
+  .pcz-card::before,
+  #pcz-reaper,
+  #pcz-reaper .pcz-scythe,
+  #pcz-reaper .pcz-blade,
+  #pcz-reaper .pcz-eye,
+  #pcz-reaper .pcz-reaper-halo,
+  #pcz-reaper .pcz-trail,
+  .pcz-bolt,
+  .pcz-bolt-flash,
+  .pcz-welcome,
+  .pcz-welcome-flash {
+    animation: none !important;
+    transition: none !important;
+  }
+
+  .pcz-card {
+    opacity: 0.45;
+  }
+
+  #pcz-reaper {
+    opacity: 0.8;
+    transform: none;
+  }
+
+  #pcz-reaper.pcz-reaper-out {
+    opacity: 0;
+  }
+
+  .pcz-ripple {
+    display: none;
+  }
+}
